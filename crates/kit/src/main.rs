@@ -41,8 +41,6 @@ mod libvirt_upload_disk;
 #[allow(dead_code)]
 mod podman;
 #[cfg(target_os = "linux")]
-mod podman_hint;
-#[cfg(target_os = "linux")]
 mod qemu;
 #[cfg(target_os = "linux")]
 mod run_ephemeral;
@@ -58,6 +56,7 @@ mod supervisor_status;
 pub(crate) mod systemd;
 #[cfg(target_os = "linux")]
 mod to_disk;
+mod native_to_disk;
 #[cfg(target_os = "linux")]
 mod utils;
 #[cfg(target_os = "linux")]
@@ -117,9 +116,6 @@ pub enum StubEphemeralCommands {
     /// Run ephemeral VM and SSH into it
     #[clap(name = "run-ssh")]
     RunSsh,
-    /// Boot an ephemeral VM and check that systemd reaches the running state
-    #[clap(name = "test-basic")]
-    TestBasic,
     /// Connect to running VMs via SSH
     #[clap(name = "ssh")]
     Ssh,
@@ -155,6 +151,7 @@ enum Commands {
     /// Install bootc images to persistent disk images
     #[clap(name = "to-disk")]
     ToDisk(to_disk::ToDiskOpts),
+    NativeToDisk(native_to_disk::NativeToDiskOpts),
 
     // Note: libvirt is intentionally NOT available on macOS
     #[cfg(target_os = "linux")]
@@ -315,6 +312,7 @@ fn main() -> Result<(), Report> {
                     println!("would-regenerate");
                 }
             }
+        Commands::NativeToDisk(opts) => native_to_disk::run(opts)?,
         }
 
         #[cfg(target_os = "linux")]
