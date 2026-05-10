@@ -22,7 +22,7 @@ jobs:
 
       - name: Install Rust stable
         run: |
-          apt-get -qq update && install curl
+          apt-get -qq update && apt-get -qq install curl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Install Rust + clippy
         run: |
-          apt-get -qq update && install curl
+          apt-get -qq update && apt-get -qq install curl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component clippy
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Clippy
