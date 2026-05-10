@@ -16,7 +16,7 @@ jobs:
       cancel-in-progress: true
     container:
       image: docker://dhi.io/debian-base@sha256:9415967aa0ed8adea8b5c048994259d1982026dca143d0303c7bbe0e11ed67d3
-      options: --rootless --cgroupns private
+      options: --help
       credentials:
         username: 0mniteck42
         password: ${{secrets.DOCKER}}
