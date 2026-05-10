@@ -28,11 +28,13 @@ jobs:
 
       # native_to_disk: check_not_mounted_parse, device_info_human_size, build_podman_cmd_contains_device
       - name: Test native-to-disk (unit, no hardware)
-        run: cargo test -p bcvk --lib native_to_disk::
+        run: |
+          cargo test -p bcvk --lib native_to_disk::
 
       # usb_passthrough: 5 pure unit tests (sysfs mocked)
       - name: Test usb-passthrough (unit, no hardware)
-        run: cargo test -p bcvk-qemu --lib usb_passthrough::
+        run: |
+          cargo test -p bcvk-qemu --lib usb_passthrough::
 
       - name: Workspace compile check
         run: cargo check --workspace
