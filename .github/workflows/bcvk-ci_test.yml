@@ -1,0 +1,55 @@
+name: ci_test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    container:
+      image: docker://dhi.io/debian-base@sha256:9415967aa0ed8adea8b5c048994259d1982026dca143d0303c7bbe0e11ed67d3
+      credentials:
+        username: 0mniteck42
+        password: ${{ secrets.DOCKER }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      # native_to_disk: check_not_mounted_parse, device_info_human_size, build_podman_cmd_contains_device
+      - name: Test native-to-disk (unit, no hardware)
+        run: cargo test -p bcvk --lib native_to_disk::
+
+      # usb_passthrough: 5 pure unit tests (sysfs mocked)
+      - name: Test usb-passthrough (unit, no hardware)
+        run: cargo test -p bcvk-qemu --lib usb_passthrough::
+
+      - name: Workspace compile check
+        run: cargo check --workspace
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    container:
+      image: docker://dhi.io/debian-base@sha256:9415967aa0ed8adea8b5c048994259d1982026dca143d0303c7bbe0e11ed67d3
+      credentials:
+        username: 0mniteck42
+        password: ${{ secrets.DOCKER }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Install Rust + clippy
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component clippy
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
