@@ -44,6 +44,7 @@
 
 mod credentials;
 mod qemu;
+pub mod usb_passthrough;
 mod virtiofsd;
 
 pub use credentials::{
@@ -57,4 +58,6 @@ pub use qemu::{
     RunningQemu, VirtioBlkDevice, VirtioSerialOut, VirtiofsMount, VHOST_VSOCK,
 };
 
+pub use usb_passthrough::{detect_yubikeys, qemu_usb_args, require_yubikeys, UsbHostDevice,
+    YUBICO_VENDOR_ID};
 pub use virtiofsd::{spawn_virtiofsd_async, validate_virtiofsd_config, VirtiofsConfig};
