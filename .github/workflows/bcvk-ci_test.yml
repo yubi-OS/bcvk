@@ -1,14 +1,16 @@
-name: ci_test
-
+name: bcvk-ci
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
-
+permissions: {}
 jobs:
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
@@ -19,40 +21,21 @@ jobs:
         password: ${{ secrets.DOCKER }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
       - name: Install Rust stable
         run: |
-          apt-get -qq update && apt-get -qq install curl
+          apt-get -qq update && apt-get -qq install --no-install-recommends build-essential curl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
       # native_to_disk: check_not_mounted_parse, device_info_human_size, build_podman_cmd_contains_device
       - name: Test native-to-disk (unit, no hardware)
         run: |
           cargo test -p bcvk --lib native_to_disk::
-
       # usb_passthrough: 5 pure unit tests (sysfs mocked)
       - name: Test usb-passthrough (unit, no hardware)
         run: |
           cargo test -p bcvk-qemu --lib usb_passthrough::
-
       - name: Workspace compile check
         run: cargo check --workspace
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    container:
-      image: docker://dhi.io/debian-base@sha256:9415967aa0ed8adea8b5c048994259d1982026dca143d0303c7bbe0e11ed67d3
-      credentials:
-        username: 0mniteck42
-        password: ${{ secrets.DOCKER }}
-    steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-      - name: Install Rust + clippy
-        run: |
-          apt-get -qq update && apt-get -qq install curl
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component clippy
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
