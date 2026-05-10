@@ -218,6 +218,15 @@ pub struct CommonVmOpts {
         help = "Generate SSH keypair and inject via systemd credentials"
     )]
     pub ssh_keygen: bool,
+
+    /// Pass YubiKey(s) from the host into the VM via QEMU USB host passthrough.
+    ///
+    /// Detects all Yubico devices (vendor 0x1050) on the host via sysfs and
+    /// forwards them directly into the VM. Fails immediately if `--yubikey`
+    /// is set but no YubiKey is detected on the host.
+    #[clap(long, help = "Forward attached YubiKey(s) from host into the VM via USB passthrough")]
+    #[serde(default)]
+    pub yubikey: bool,
 }
 
 impl CommonVmOpts {
@@ -1353,6 +1362,15 @@ StandardOutput=file:/dev/virtio-ports/executestatus
         let pubkey = std::fs::read_to_string(key_pair.public_key_path.as_path())?;
         let credential = crate::credentials::smbios_cred_for_root_ssh(&pubkey)?;
         qemu_config.add_smbios_credential(credential);
+    }
+
+    // YubiKey USB passthrough
+    #[cfg(target_os = "linux")]
+    if opts.common.yubikey {
+        let keys = bcvk_qemu::usb_passthrough::require_yubikeys()?;
+        for key in keys {
+            qemu_config.add_usb_host_device(key);
+        }
     }
 
     // Build kernel command line for direct boot
