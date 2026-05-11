@@ -28,8 +28,7 @@ jobs:
         with:
           use: true
           buildkitd-flags: --oci-worker-rootless true
-          rootless: true
-          version: 0.33.0
+          version: 0.31.0
           endpoint: rootless
           cache-binary: false
           driver-opts: |
