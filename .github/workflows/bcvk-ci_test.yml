@@ -11,12 +11,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    services:
+      dockerd:
+        image: docker://docker.io/moby/buildkit:v0.29.0@0039c1d47e8748b5afea56f4e85f14febaf34452bd99d9552d2daa82262b5cc5
+        options: --cgroupns=private --disable-content-trust=false
+        credentials:
+          username: 0mniteck42
+          password: ${{secrets.DOCKER}}
+        env:
+          INPUT_VERSION: 29.3.1
+        command: set -xv && /bin/bash
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
+      group: ${{github.workflow}}-${{github.ref}}
       cancel-in-progress: true
     container:
       image: docker://dhi.io/debian-base@sha256:9415967aa0ed8adea8b5c048994259d1982026dca143d0303c7bbe0e11ed67d3
-      options: --help
+      options: --cgroupns=private --disable-content-trust=false
       credentials:
         username: 0mniteck42
         password: ${{secrets.DOCKER}}
