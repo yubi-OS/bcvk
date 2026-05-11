@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]
 permissions: {}
+env:
+  SOURCE_DATE_EPOCH: 0
 jobs:
   unit-tests:
     name: Unit tests
@@ -13,14 +15,13 @@ jobs:
       contents: read
     services:
       dockerd:
-        image: docker://docker.io/moby/buildkit:v0.29.0@0039c1d47e8748b5afea56f4e85f14febaf34452bd99d9552d2daa82262b5cc5
+        image: docker://docker.io/moby/buildkit:v0.29.0@sha256:8550ee821375d58adc345db341b1c08df993d8411544b36fd4c6cb2dd2fb12c5
         options: --cgroupns=private --disable-content-trust=false
         credentials:
           username: 0mniteck42
           password: ${{secrets.DOCKER}}
         env:
           INPUT_VERSION: 29.3.1
-        command: set -xv && /bin/bash
     concurrency:
       group: ${{github.workflow}}-${{github.ref}}
       cancel-in-progress: true
