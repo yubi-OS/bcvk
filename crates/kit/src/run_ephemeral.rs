@@ -231,6 +231,12 @@ pub struct CommonVmOpts {
         help = "Attach a software TPM 2.0 (swtpm) so /dev/tpm0 is present in the VM (test-only; CI without hardware)"
     )]
     pub swtpm: bool,
+
+    #[clap(
+        long = "swu2f",
+        help = "Load the uhid kernel module so an in-guest software FIDO2/U2F authenticator can expose /dev/uhid (test-only; CI without a physical YubiKey)"
+    )]
+    pub swu2f: bool,
 }
 
 impl CommonVmOpts {
@@ -1406,6 +1412,14 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     }
 
     kernel_cmdline.extend(opts.kernel_args.clone());
+
+    // Software FIDO2/U2F (swu2f): QEMU cannot emulate a CTAP2 authenticator with the
+    // hmac-secret extension that systemd-cryptenroll requires, so the authenticator runs
+    // *inside* the guest over /dev/uhid. bcvk only ensures the uhid module is present.
+    if opts.common.swu2f {
+        bcvk_qemu::swu2f::push_uhid_kargs(&mut kernel_cmdline);
+    }
+
     qemu_config.set_kernel_cmdline(kernel_cmdline);
 
     if opts.common.swtpm {
