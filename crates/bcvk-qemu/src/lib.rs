@@ -44,6 +44,7 @@
 
 mod credentials;
 mod qemu;
+pub mod swtpm;
 mod virtiofsd;
 
 pub use credentials::{
@@ -58,3 +59,5 @@ pub use qemu::{
 };
 
 pub use virtiofsd::{spawn_virtiofsd_async, validate_virtiofsd_config, VirtiofsConfig};
+
+pub use swtpm::{tpm_device_for_arch, SwtpmConfig};

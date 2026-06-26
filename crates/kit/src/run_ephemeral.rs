@@ -225,6 +225,16 @@ pub struct CommonVmOpts {
         help = "Path to virtiofsd binary (overrides auto-detection)"
     )]
     pub virtiofsd_binary: Option<String>,
+
+    /// Enable optional VM features (repeatable). Supported: `tpm2-swtpm`
+    /// (software TPM 2.0 via swtpm, for CI coverage of TPM2 code paths).
+    #[clap(
+        long = "feature",
+        value_name = "FEATURE",
+        help = "Enable a VM feature (repeatable); supported: tpm2-swtpm"
+    )]
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 impl CommonVmOpts {
@@ -1549,6 +1559,16 @@ Options=
     }
 
     qemu_config.set_console(opts.common.console);
+
+    // Optional VM features (e.g. software TPM 2.0 for CI coverage).
+    if opts
+        .common
+        .features
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case("tpm2-swtpm"))
+    {
+        qemu_config.enable_swtpm()?;
+    }
 
     // Add virtio-serial device for journal streaming
     qemu_config.add_virtio_serial_out("org.bcvk.journal", "/run/journal.log".to_string(), false);

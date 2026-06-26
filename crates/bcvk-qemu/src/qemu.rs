@@ -229,6 +229,11 @@ pub struct QemuConfig {
 
     /// fw_cfg entries for passing config files to the guest
     fw_cfg_entries: Vec<(String, Utf8PathBuf)>,
+
+    /// Optional software TPM (swtpm) for CI VMs. When set, bcvk launches an
+    /// swtpm process before QEMU and wires an emulated TPM 2.0 into the guest
+    /// (visible as `/dev/tpm0`). Test coverage only; see yubiOS ADR-016.
+    pub swtpm: Option<crate::swtpm::SwtpmConfig>,
 }
 
 impl QemuConfig {
@@ -463,6 +468,17 @@ impl QemuConfig {
     pub fn add_fw_cfg(&mut self, name: String, file_path: Utf8PathBuf) -> &mut Self {
         self.fw_cfg_entries.push((name, file_path));
         self
+    }
+
+    /// Enable a software TPM (swtpm) for this VM.
+    ///
+    /// Prepares an swtpm state directory and control socket. The swtpm process
+    /// is launched by [`RunningQemu::spawn`] before QEMU starts, and an emulated
+    /// TPM 2.0 is wired into the guest (visible as `/dev/tpm0`). Intended for CI
+    /// coverage of TPM2 code paths without physical hardware (yubiOS ADR-016).
+    pub fn enable_swtpm(&mut self) -> Result<&mut Self> {
+        self.swtpm = Some(crate::swtpm::SwtpmConfig::new()?);
+        Ok(self)
     }
 }
 
@@ -759,6 +775,13 @@ fn spawn(
         cmd.args(["-fw_cfg", &format!("name={},file={}", name, file_path)]);
     }
 
+    // Software TPM (swtpm) emulator device, when enabled.
+    if let Some(swtpm) = &config.swtpm {
+        for arg in swtpm.qemu_args(std::env::consts::ARCH) {
+            cmd.arg(arg);
+        }
+    }
+
     // Configure stdio based on display mode
     match &config.display_mode {
         DisplayMode::Console => {
@@ -804,6 +827,8 @@ pub struct RunningQemu {
     pub virtiofsd_processes: Vec<Pin<Box<dyn Future<Output = std::io::Result<Output>>>>>,
     #[allow(dead_code)]
     sd_notification: Option<VsockCopier>,
+    /// swtpm process backing the emulated TPM; killed when the VM stops.
+    swtpm_process: Option<Child>,
 }
 
 impl std::fmt::Debug for RunningQemu {
@@ -971,6 +996,20 @@ impl RunningQemu {
             })
             .unwrap_or_default();
 
+        // Launch swtpm (software TPM) before QEMU so the control socket exists
+        // when QEMU connects. The matching QEMU device args are emitted by `spawn`.
+        let swtpm_process = if let Some(swtpm) = config.swtpm.as_ref() {
+            debug!("starting swtpm with state dir {}", swtpm.state_dir);
+            let child = swtpm
+                .command()
+                .spawn()
+                .context("failed to spawn swtpm (is the swtpm package installed in the image?)")?;
+            crate::swtpm::wait_for_socket(&swtpm.socket_path, Duration::from_secs(10))?;
+            Some(child)
+        } else {
+            None
+        };
+
         // Spawn QEMU process with additional VSOCK credential if needed
         let qemu_process = spawn(&config, &creds, vsockdata)?;
 
@@ -978,12 +1017,17 @@ impl RunningQemu {
             qemu_process,
             virtiofsd_processes,
             sd_notification,
+            swtpm_process,
         })
     }
 
     /// Wait for QEMU process to exit.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
         let r = self.qemu_process.wait()?;
+        if let Some(mut swtpm) = self.swtpm_process.take() {
+            let _ = swtpm.kill();
+            let _ = swtpm.wait();
+        }
         Ok(r)
     }
 }
