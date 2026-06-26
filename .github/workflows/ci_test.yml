@@ -1,0 +1,83 @@
+name: ci_test
+
+# Multi-arch native CI for the yubiOS bcvk fork. Rust test + clippy run on both
+# amd64 and arm64 GitHub-hosted runners (no QEMU) so arch-specific behaviour in
+# the virtualization kit is exercised natively. Refs pinned per PINNED.md.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Unit tests (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: ${{ github.workflow }}-tests-${{ matrix.arch }}-${{ github.ref }}
+      cancel-in-progress: true
+    container:
+      image: docker://dhi.io/debian-base@sha256:1cefd55d979ddbd9110cf73cf3de11798a7893a4598050ba57624bc754b244aa # trixie-debian13-dev INDEX (auto-resolves per arch)
+      credentials:
+        username: 0mniteck42
+        password: ${{ secrets.DOCKER }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # see PINNED.md
+
+      - name: Install build deps + Rust stable
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends curl ca-certificates gcc pkg-config libssl-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # native_to_disk: check_not_mounted_parse, device_info_human_size, build_podman_cmd_contains_device
+      - name: Test native-to-disk (unit, no hardware)
+        run: "cargo test -p bcvk --lib native_to_disk::"
+
+      # usb_passthrough: pure unit tests (sysfs mocked)
+      - name: Test usb-passthrough (unit, no hardware)
+        run: "cargo test -p bcvk-qemu --lib usb_passthrough::"
+
+      - name: Workspace compile check
+        run: cargo check --workspace
+
+  clippy:
+    name: Clippy (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: docker://dhi.io/debian-base@sha256:1cefd55d979ddbd9110cf73cf3de11798a7893a4598050ba57624bc754b244aa # trixie-debian13-dev INDEX
+      credentials:
+        username: 0mniteck42
+        password: ${{ secrets.DOCKER }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Install build deps + Rust + clippy
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends curl ca-certificates gcc pkg-config libssl-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
