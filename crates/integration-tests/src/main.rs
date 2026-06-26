@@ -18,6 +18,7 @@ mod tests {
     pub mod libvirt_to_base_disk;
     pub mod libvirt_upload_disk;
     pub mod libvirt_verb;
+    pub mod luks2_fido2_e2e;
     pub mod mount_feature;
     pub mod run_ephemeral;
     pub mod run_ephemeral_ignition;

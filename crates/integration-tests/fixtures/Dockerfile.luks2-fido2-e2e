@@ -1,0 +1,18 @@
+# Test fixture for the LUKS2 FIDO2 + systemd-homed + pam-u2f e2e (yubiOS#33).
+# Test-only image: yubiOS production trust anchor stays the YubiKey (ADR-003).
+#
+# Provides the guest-side tooling the e2e needs on top of a systemd>=261 bootc
+# base. The in-guest CTAP2 /dev/uhid software authenticator (docs/swu2f.md
+# "Layer 2") is NOT installed here yet — that is the follow-up that unblocks
+# test_luks2_fido2_unlock_homed_e2e.
+FROM quay.io/fedora/fedora-bootc:45
+
+RUN dnf install -y \
+        cryptsetup \
+        libfido2 \
+        pam-u2f \
+        systemd-cryptsetup \
+        systemd-homed \
+    && dnf clean all
+
+# uhid is a module; --swu2f adds modules-load=uhid on the kernel cmdline.
