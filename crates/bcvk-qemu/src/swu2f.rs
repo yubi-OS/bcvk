@@ -1,68 +1,55 @@
-//! Software FIDO2/U2F authenticator (swu2f) wiring for ephemeral CI VMs.
+//! Software U2F / FIDO2 device for bcvk ephemeral VMs (test-only).
 //!
-//! Unlike [`crate::swtpm`], a software FIDO2 token cannot be provided by QEMU:
-//! QEMU only ships `u2f-emulated`, which speaks CTAP1/U2F and lacks the CTAP2
-//! `hmac-secret` extension that `systemd-cryptenroll --fido2-device` and LUKS2
-//! FIDO2 unlock require. The authenticator therefore runs *inside* the guest as
-//! a userspace daemon (e.g. `fidorium` or `passless`) that registers a virtual
-//! FIDO HID device through `/dev/uhid`. libfido2 (`fido2-token -L`),
-//! `systemd-cryptenroll`, and `pam-u2f` then see it as a real token.
+//! Mirrors the `swtpm` module: a YubiKey-free way to exercise FIDO2/U2F code
+//! paths in CI VMs without physical hardware. There are two distinct layers,
+//! because the standards split the same way:
 //!
-//! bcvk's only responsibility on the host side is to make sure the guest kernel
-//! has the `uhid` module available early via a `modules-load=` karg. The
-//! authenticator binary itself must be present in the test image (image side,
-//! analogous to shipping `swtpm`/`swtpm-tools` for [`crate::swtpm`]).
+//! 1. **QEMU emulated U2F** (`-device u2f-emulated`, backed by libu2f-emu): a
+//!    fully software USB HID token implementing the **U2F (CTAP1)** protocol.
+//!    Host/QEMU-provided and deterministic, exactly like swtpm — the guest sees
+//!    a real USB HID security key with no in-guest service. This covers
+//!    `pam-u2f` login tests. It does NOT implement CTAP2/FIDO2 `hmac-secret`,
+//!    so it cannot drive `systemd-cryptenroll --fido2` (see docs/swu2f.md).
 //!
-//! Test-only: yubiOS production trust stays on the physical YubiKey FIDO2 device
-//! (ADR-003). swu2f exists purely to cover enrollment / PAM code paths in CI
-//! without hardware. See `docs/swu2f.md` and yubiOS issue #25.
+//! 2. **In-guest uhid CTAP2 authenticator** (FIDO2 `hmac-secret`): a software
+//!    authenticator that creates a virtual HID FIDO2 device via `/dev/uhid`
+//!    inside the guest, for `systemd-cryptenroll --fido2` LUKS2 unlock tests.
+//!    That layer is guest-image work (a fixture + a software authenticator),
+//!    documented in docs/swu2f.md; it is out of scope for this QEMU-arg builder.
+//!
+//! yubiOS production trust anchor remains the **YubiKey FIDO2** device
+//! (yubiOS ADR-003); swu2f is strictly for test coverage. Tracks
+//! yubi-OS/yubiOS#25.
+//!
+//! This module is pure: it only builds argument vectors. Any process/IO lives
+//! in `qemu.rs`, per the bcvk REVIEW.md rule of splitting builders from I/O.
 
-/// Feature name used in user-facing flags / docs.
-pub const SWU2F_FEATURE: &str = "fido2-swu2f";
-
-/// Kernel module that backs userspace HID devices (`/dev/uhid`).
-pub const UHID_MODULE: &str = "uhid";
-
-/// Device node a uhid-based authenticator opens to register itself.
-pub const UHID_DEVICE_PATH: &str = "/dev/uhid";
-
-/// The `modules-load=` kernel argument that ensures `uhid` is loaded.
-pub fn uhid_karg() -> String {
-    format!("modules-load={UHID_MODULE}")
-}
-
-/// Append the `uhid` `modules-load=` karg to a kernel cmdline if not already present.
-///
-/// Idempotent: a second call with the same cmdline is a no-op.
-pub fn push_uhid_kargs(cmdline: &mut Vec<String>) {
-    let karg = uhid_karg();
-    if !cmdline.iter().any(|a| a == &karg) {
-        cmdline.push(karg);
-    }
-}
-
-/// Configuration for the in-guest software FIDO2/U2F authenticator.
-///
-/// Currently this only records which authenticator binary the test image is
-/// expected to provide; the daemon lifecycle is owned by the guest (a systemd
-/// unit in the image), not by bcvk on the host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Configuration for the QEMU emulated U2F (CTAP1) USB token.
+#[derive(Debug, Clone, Default)]
 pub struct Swu2fConfig {
-    /// Name of the userspace authenticator binary shipped in the test image.
-    pub authenticator: String,
+    /// Optional libu2f-emu setup directory. When present it must contain
+    /// `certificate.pem`, `private-key.pem`, `counter`, and `entropy` (48
+    /// bytes), giving the token a stable identity across runs. When `None`,
+    /// the device runs in libu2f-emu **ephemeral** mode and generates a
+    /// single-use identity for the lifetime of the VM.
+    pub setup_dir: Option<String>,
 }
 
-impl Default for Swu2fConfig {
-    fn default() -> Self {
-        Self { authenticator: "fidorium".to_string() }
+/// Build the QEMU arguments wiring an emulated USB U2F token into the VM.
+///
+/// Matches the QEMU documented invocation:
+/// - ephemeral:    `-usb -device u2f-emulated`
+/// - setup dir:    `-usb -device u2f-emulated,dir=<dir>`
+///
+/// `-usb` attaches the machine's default USB controller so the HID token can
+/// enumerate. The guest `u2f`/`hid-generic` driver then exposes it as a
+/// `/dev/hidrawN` security key — usable by libfido2 and pam-u2f.
+pub fn qemu_u2f_args(config: &Swu2fConfig) -> Vec<String> {
+    let mut device = "u2f-emulated".to_string();
+    if let Some(dir) = &config.setup_dir {
+        device.push_str(&format!(",dir={dir}"));
     }
-}
-
-impl Swu2fConfig {
-    /// Build a config naming a specific authenticator binary.
-    pub fn with_authenticator(authenticator: impl Into<String>) -> Self {
-        Self { authenticator: authenticator.into() }
-    }
+    vec!["-usb".to_string(), "-device".to_string(), device]
 }
 
 #[cfg(test)]
@@ -70,39 +57,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uhid_karg_is_modules_load() {
-        assert_eq!(uhid_karg(), "modules-load=uhid");
+    fn test_u2f_args_ephemeral() {
+        let args = qemu_u2f_args(&Swu2fConfig::default());
+        assert_eq!(args, vec!["-usb", "-device", "u2f-emulated"]);
     }
 
     #[test]
-    fn push_uhid_kargs_appends_once() {
-        let mut c = vec!["selinux=0".to_string()];
-        push_uhid_kargs(&mut c);
-        push_uhid_kargs(&mut c);
-        assert_eq!(c.iter().filter(|a| a.as_str() == "modules-load=uhid").count(), 1);
-        assert!(c.contains(&"selinux=0".to_string()));
+    fn test_u2f_args_setup_dir() {
+        let cfg = Swu2fConfig {
+            setup_dir: Some("/run/u2f-setup".to_string()),
+        };
+        let args = qemu_u2f_args(&cfg);
+        assert_eq!(args[0], "-usb");
+        assert_eq!(args[1], "-device");
+        assert_eq!(args[2], "u2f-emulated,dir=/run/u2f-setup");
     }
 
     #[test]
-    fn push_uhid_kargs_preserves_order_tail() {
-        let mut c = vec!["a".to_string(), "b".to_string()];
-        push_uhid_kargs(&mut c);
-        assert_eq!(c.last().unwrap(), "modules-load=uhid");
-    }
-
-    #[test]
-    fn default_authenticator() {
-        assert_eq!(Swu2fConfig::default().authenticator, "fidorium");
-    }
-
-    #[test]
-    fn with_authenticator_overrides() {
-        assert_eq!(Swu2fConfig::with_authenticator("passless").authenticator, "passless");
-    }
-
-    #[test]
-    fn device_path_is_uhid() {
-        assert_eq!(UHID_DEVICE_PATH, "/dev/uhid");
-        assert_eq!(SWU2F_FEATURE, "fido2-swu2f");
+    fn test_u2f_args_arg_count() {
+        assert_eq!(qemu_u2f_args(&Swu2fConfig::default()).len(), 3);
     }
 }

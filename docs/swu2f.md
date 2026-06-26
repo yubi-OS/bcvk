@@ -1,54 +1,109 @@
-# swu2f — in-guest software FIDO2/U2F for CI VMs
+# Software U2F / FIDO2 (swu2f) for CI VMs
 
-For [yubiOS issue #25](https://github.com/yubi-OS/yubiOS/issues/25) (post-launch):
-a software FIDO2/U2F authenticator so enrollment and PAM tests run without a
-physical YubiKey. Pairs with the host-side `--swtpm` support on this branch.
+bcvk can give an ephemeral VM a software FIDO2/U2F authenticator so yubiOS can
+exercise `pam-u2f` and `systemd-cryptenroll --fido2` code paths in CI **without
+a physical YubiKey**.
 
-## Why in-guest (not a QEMU device)
+> yubiOS production trust anchor remains the **YubiKey FIDO2** device
+> (yubiOS ADR-003). swu2f is **test-only**. Tracks yubi-OS/yubiOS#25.
 
-swtpm can be wired host-side because QEMU has a real TPM emulator backend
-(`-tpmdev emulator`). FIDO2 has no equivalent: QEMU only offers `u2f-emulated`,
-which speaks **CTAP1/U2F** and does **not** implement the CTAP2 `hmac-secret`
-extension. `systemd-cryptenroll --fido2-device` and LUKS2 FIDO2 unlock *require*
-`hmac-secret`, so a host-emulated U2F device is unusable for the enrollment path
-we need to cover.
+This mirrors the `swtpm` feature (see `docs/swtpm.md`): a host/QEMU-provided
+virtual device the guest sees as real hardware. But FIDO2/U2F splits into two
+layers, and each yubiOS consumer needs a different one.
 
-The working approach is a userspace CTAP2 authenticator running **inside the
-guest** that registers a virtual FIDO HID device via the kernel `uhid`
-interface (`/dev/uhid`). libfido2 then sees it as a normal token:
+## The CTAP1 vs CTAP2 split (read this first)
 
-- `fido2-token -L` lists it
-- `systemd-cryptenroll --fido2-device=auto <luks>` enrolls against it
-- `pam-u2f` authenticates against it
+| Consumer                       | Protocol needed             | swu2f layer |
+|--------------------------------|-----------------------------|-------------|
+| `pam-u2f` login                | U2F / CTAP1                 | Layer 1 (QEMU `u2f-emulated`) |
+| `systemd-cryptenroll --fido2`  | FIDO2 / CTAP2 `hmac-secret` | Layer 2 (in-guest uhid CTAP2) |
 
-Known implementations: [`fidorium`](https://github.com/grawity/fidorium) and
-[`passless`](https://github.com/pando85/passless) (both `/dev/uhid` + CTAP2 +
-`hmac-secret`).
+QEMU's `u2f-emulated` is backed by [libu2f-emu], which implements the **U2F
+(CTAP1)** protocol only. It is perfect for pam-u2f but cannot satisfy
+`systemd-cryptenroll --fido2`, which requires the CTAP2 `hmac-secret` extension
+to derive the LUKS2 key. Don't conflate the two.
 
-## Split of responsibilities
+[libu2f-emu]: https://github.com/Agnoctopus/libu2f-emu
 
-| Layer | Owns |
-|---|---|
-| **bcvk** (`--swu2f`) | adds `modules-load=uhid` to the guest kernel cmdline so `/dev/uhid` exists early |
-| **test image** | ships the authenticator binary + a systemd unit that starts it (image side, like `swtpm`/`swtpm-tools` for swtpm) |
-| **udev** | `KERNEL=="uhid", GROUP="input", MODE="0660"` so the daemon can open the node |
+## Layer 1 — QEMU emulated U2F (CTAP1, pam-u2f)
 
-## Usage
+A completely software USB HID U2F token, provided by QEMU. Deterministic and
+host-side, exactly like swtpm; no in-guest service required.
+
+Proposed usage (mirrors `--swtpm`):
 
 ```bash
-bcvk ephemeral run --swu2f dhi.io/yubi-OS/yubiOS:latest
+bcvk ephemeral run --swu2f quay.io/fedora/fedora-bootc:45
 ```
 
-The guest then exposes a software FIDO2 token; tests can enroll and authenticate.
+QEMU args emitted (see `crates/bcvk-qemu/src/swu2f.rs`):
 
-## Boot-time unlock caveat
+```
+-usb -device u2f-emulated                 # ephemeral identity (default)
+-usb -device u2f-emulated,dir=<setup-dir> # stable identity from a setup dir
+```
 
-For unlocking the **root** LUKS2 volume the authenticator must run in the
-initramfs (before the disk is decrypted). For CI we target **post-boot**
-enrollment/auth against a scratch LUKS2 container, which avoids the initramfs
-ordering hazard. Root-unlock-in-initramfs coverage is a separate, later step.
+A libu2f-emu *setup directory* contains `certificate.pem`, `private-key.pem`,
+`counter`, and `entropy` (48 bytes). With no directory the device runs in
+**ephemeral** mode and mints a single-use identity for the VM lifetime — fine
+for a register+authenticate pam-u2f smoke test.
 
-## Scope
+Inside the VM:
 
-Test-only. Production root of trust remains the physical YubiKey FIDO2 device
-(ADR-003). swu2f exists solely for hardware-free CI coverage.
+```bash
+ls -l /dev/hidraw*        # the emulated token appears as a HID security key
+fido2-token -L            # libfido2 enumerates it
+pamu2fcfg                 # register it for pam-u2f
+```
+
+### Runtime dependency
+
+The bcvk runner environment must provide libu2f-emu so QEMU's `u2f-emulated`
+device is available (QEMU must be built `--enable-u2f`, which Fedora's qemu
+packages are):
+
+```bash
+dnf install -y libu2f-emu   # Fedora
+```
+
+## Layer 2 — in-guest uhid CTAP2 authenticator (FIDO2, systemd-cryptenroll)
+
+`systemd-cryptenroll --fido2-device=auto` needs CTAP2 `hmac-secret`, which
+libu2f-emu does not provide. The portable way to get a CTAP2 authenticator in a
+VM with no hardware is a **software authenticator that creates a virtual HID
+device via `/dev/uhid`** inside the guest, then enroll against it:
+
+```bash
+systemd-cryptenroll --fido2-device=auto --fido2-with-client-pin=no /tmp/test.luks
+```
+
+This is guest-image work, not a QEMU device, so it is intentionally **not** in
+the `swu2f.rs` arg builder. It needs:
+
+1. a test fixture image (`fixtures/Dockerfile.swu2f`) carrying a CTAP2 software
+   authenticator (e.g. a uhid-based libfido2 virtual device) + `libfido2` +
+   `systemd-cryptenroll`;
+2. `modules-load` for `uhid`;
+3. an integration test that registers the virtual authenticator, runs
+   `systemd-cryptenroll --fido2`, then reboots and unlocks.
+
+The `bcvk-virtualization` skill also notes `virtual-fido` (Go, USB/IP via
+`vhci-hcd`) as an alternative CTAP2 emulator; uhid keeps the device fully
+in-guest with no USB/IP host kernel modules. Pick one in the follow-up PR.
+
+## Why split it this way
+
+Same rationale as swtpm: bcvk ephemeral boot uses **direct kernel boot** and
+runs QEMU inside a privileged podman container. A host-provided QEMU HID device
+(`u2f-emulated`) is the deterministic, dependency-light path and covers the
+CTAP1/pam-u2f case immediately. The CTAP2/FIDO2 enrollment path is heavier
+(needs a guest authenticator) and is staged as Layer 2 so pam-u2f coverage
+isn't blocked on it.
+
+## Status
+
+Layer 1: QEMU-arg builder + flag spec landed on `feat/swtpm-ci` (this doc +
+`swu2f.rs`). The `--swu2f` CLI flag and `QemuConfig` wiring follow the exact
+`--swtpm` pattern and land in the same wiring PR (needs `cargo build` +
+`cargo nextest` + human Signed-off-by before merge). Layer 2 is a separate
+guest-image PR. Tracks yubi-OS/yubiOS#25.
