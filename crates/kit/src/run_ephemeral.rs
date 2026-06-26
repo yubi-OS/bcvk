@@ -225,6 +225,12 @@ pub struct CommonVmOpts {
         help = "Path to virtiofsd binary (overrides auto-detection)"
     )]
     pub virtiofsd_binary: Option<String>,
+
+    #[clap(
+        long = "swtpm",
+        help = "Attach a software TPM 2.0 (swtpm) so /dev/tpm0 is present in the VM (test-only; CI without hardware)"
+    )]
+    pub swtpm: bool,
 }
 
 impl CommonVmOpts {
@@ -1401,6 +1407,14 @@ StandardOutput=file:/dev/virtio-ports/executestatus
 
     kernel_cmdline.extend(opts.kernel_args.clone());
     qemu_config.set_kernel_cmdline(kernel_cmdline);
+
+    if opts.common.swtpm {
+        // swtpm control socket lives in the shared run dir; state in tmpfs.
+        qemu_config.enable_swtpm(
+            "/run/inner-shared/swtpm.sock".to_string(),
+            "/run/swtpm-state".to_string(),
+        );
+    }
 
     // Add Ignition config if specified
     // Different architectures require different methods (per FCOS docs):

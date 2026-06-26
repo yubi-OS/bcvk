@@ -229,6 +229,10 @@ pub struct QemuConfig {
 
     /// fw_cfg entries for passing config files to the guest
     fw_cfg_entries: Vec<(String, Utf8PathBuf)>,
+
+    /// Optional software TPM (swtpm) backing the QEMU emulator TPM device.
+    /// Test-only vTPM so `/dev/tpm0` is present in CI VMs without hardware.
+    pub swtpm: Option<crate::swtpm::SwtpmConfig>,
 }
 
 impl QemuConfig {
@@ -288,6 +292,15 @@ impl QemuConfig {
         if enable {
             self.display_mode = DisplayMode::Console;
         }
+        self
+    }
+
+    /// Enable a software TPM (swtpm) backed emulator TPM device.
+    ///
+    /// `socket_path` is the swtpm control socket QEMU connects to; `state_dir`
+    /// holds the (ephemeral) TPM NVRAM. Test-only; see yubi-OS/bcvk#3.
+    pub fn enable_swtpm(&mut self, socket_path: String, state_dir: String) -> &mut Self {
+        self.swtpm = Some(crate::swtpm::SwtpmConfig { socket_path, state_dir });
         self
     }
 
@@ -650,6 +663,14 @@ fn spawn(
         ]);
     }
 
+    // Software TPM (swtpm) emulator backend: chardev -> tpmdev -> tpm device.
+    // The guest kernel tpm_tis/tpm_crb driver creates /dev/tpm0 from this device.
+    if let Some(swtpm) = config.swtpm.as_ref() {
+        for arg in crate::swtpm::qemu_tpm_args(&swtpm.socket_path, std::env::consts::ARCH) {
+            cmd.arg(arg);
+        }
+    }
+
     // Add virtio-serial controller - always needed for console
     cmd.args(["-device", "virtio-serial"]);
 
@@ -781,6 +802,49 @@ fn spawn(
     cmd.spawn().context("Failed to spawn QEMU")
 }
 
+/// Spawn a `swtpm socket` process providing a software TPM 2.0 over a UNIX
+/// control socket, then wait for the socket to appear so QEMU can connect.
+async fn spawn_swtpm(config: &crate::swtpm::SwtpmConfig) -> Result<Child> {
+    std::fs::create_dir_all(&config.state_dir)
+        .with_context(|| format!("creating swtpm state dir {}", config.state_dir))?;
+
+    let (program, args) = crate::swtpm::swtpm_socket_command(config);
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    // SAFETY: This API is safe to call in a forked child. Ties swtpm lifetime to ours.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))
+                .map_err(Into::into)
+        });
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
+    tracing::debug!("Spawning swtpm: {program} {args:?}");
+    let child = cmd.spawn().context("Failed to spawn swtpm")?;
+
+    let socket_path = Utf8Path::new(&config.socket_path).to_owned();
+    let wait = async {
+        loop {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::pin!(wait);
+    let timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(timeout);
+    tokio::select! {
+        _ = &mut wait => {}
+        _ = &mut timeout => {
+            return Err(eyre!("timed out waiting for swtpm socket {}", config.socket_path));
+        }
+    }
+    tracing::debug!("swtpm socket ready: {}", config.socket_path);
+    Ok(child)
+}
+
 struct VsockCopier {
     port: VsockAddr,
     #[allow(dead_code)]
@@ -804,6 +868,9 @@ pub struct RunningQemu {
     pub virtiofsd_processes: Vec<Pin<Box<dyn Future<Output = std::io::Result<Output>>>>>,
     #[allow(dead_code)]
     sd_notification: Option<VsockCopier>,
+    /// Host swtpm process backing the emulator TPM, kept alive for the VM lifetime.
+    #[allow(dead_code)]
+    swtpm_process: Option<Child>,
 }
 
 impl std::fmt::Debug for RunningQemu {
@@ -971,6 +1038,13 @@ impl RunningQemu {
             })
             .unwrap_or_default();
 
+        // Start the swtpm socket process (if configured) before QEMU connects.
+        let swtpm_process = if let Some(swtpm) = config.swtpm.clone() {
+            Some(spawn_swtpm(&swtpm).await?)
+        } else {
+            None
+        };
+
         // Spawn QEMU process with additional VSOCK credential if needed
         let qemu_process = spawn(&config, &creds, vsockdata)?;
 
@@ -978,6 +1052,7 @@ impl RunningQemu {
             qemu_process,
             virtiofsd_processes,
             sd_notification,
+            swtpm_process,
         })
     }
 

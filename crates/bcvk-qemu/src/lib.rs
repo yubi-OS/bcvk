@@ -44,6 +44,7 @@
 
 mod credentials;
 mod qemu;
+pub mod swtpm;
 mod virtiofsd;
 
 pub use credentials::{
@@ -56,5 +57,7 @@ pub use qemu::{
     BootMode, DiskFormat, DisplayMode, MachineType, NetworkMode, QemuConfig, ResourceLimits,
     RunningQemu, VirtioBlkDevice, VirtioSerialOut, VirtiofsMount, VHOST_VSOCK,
 };
+
+pub use swtpm::SwtpmConfig;
 
 pub use virtiofsd::{spawn_virtiofsd_async, validate_virtiofsd_config, VirtiofsConfig};
