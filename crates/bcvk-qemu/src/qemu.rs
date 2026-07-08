@@ -923,9 +923,12 @@ impl RunningQemu {
                     tracing::trace!("virtiofsd exited");
                     let output = output?;
                     let status = output.status;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
+                    let log_path = format!("{socket_path}.log");
+                    let log_tail = std::fs::read_to_string(&log_path).unwrap_or_default();
                     return Err(eyre!(
-                        "virtiofsd failed to start for socket {socket_path}\nExit status: {status:?}\nOutput: {stderr}"
+                        "virtiofsd failed to start for socket {socket_path}\nExit status: {status:?}\nStdout: {stdout}\nStderr: {stderr}\nLog file ({log_path}):\n{log_tail}"
                     ));
                 }
                 _ = timeout => {
