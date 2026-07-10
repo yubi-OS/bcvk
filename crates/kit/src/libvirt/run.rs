@@ -29,6 +29,7 @@ const UPDATE_FROM_HOST_TRANSPORT: &str = "containers-storage";
 /// Create a virsh command with optional connection URI
 pub(super) fn virsh_command(connect_uri: Option<&str>) -> Result<std::process::Command> {
     let mut cmd = std::process::Command::new("virsh");
+    cmd.env("LC_ALL", "C");
     if let Some(uri) = connect_uri {
         cmd.arg("-c").arg(uri);
     }
@@ -297,6 +298,10 @@ pub struct LibvirtRunOpts {
     #[clap(long)]
     pub label: Vec<String>,
 
+    /// Enable graphical console (SPICE) for virt-manager access
+    #[clap(long)]
+    pub graphical_console: bool,
+
     /// Create a transient VM that disappears on shutdown/reboot
     #[clap(long)]
     pub transient: bool,
@@ -305,6 +310,14 @@ pub struct LibvirtRunOpts {
     #[clap(long = "ignition")]
     pub ignition_config: Option<Utf8PathBuf>,
 
+    /// Log virtio console (OS/journald on hvc0) to this file (created if absent)
+    #[clap(long = "console-log")]
+    pub console_log: Option<Utf8PathBuf>,
+
+    /// Log platform console (UEFI/bootloader on ttyS0) to this file (created if absent)
+    #[clap(long = "platform-console-log")]
+    pub platform_console_log: Option<Utf8PathBuf>,
+
     /// Additional metadata key-value pairs (used internally, not exposed via CLI)
     #[clap(skip)]
     pub metadata: std::collections::HashMap<String, String>,
@@ -312,6 +325,17 @@ pub struct LibvirtRunOpts {
     /// Additional SMBIOS credentials to inject (used internally, not exposed via CLI)
     #[clap(skip)]
     pub extra_smbios_credentials: Vec<String>,
+
+    /// Write VM log streams to files in DIR.
+    ///
+    /// STREAMS is a comma-separated list of: `journal`, `console`
+    /// - `journal` → `journal.json` (systemd journal as JSON via virtio-serial channel)
+    /// - `console` → `console.txt` (VM virtio console output, i.e. hvc0)
+    ///
+    /// Examples: `--log-dir=journal,console=/tmp/run-001/`
+    ///           `--log-dir=journal=/tmp/logs/`
+    #[clap(long, value_name = "STREAMS=DIR")]
+    pub log_dir: Option<crate::run_ephemeral::LogDir>,
 }
 
 impl LibvirtRunOpts {
@@ -347,9 +371,10 @@ impl LibvirtRunOpts {
     }
 }
 
-/// Wait for SSH to become available on a libvirt domain
+/// Wait for SSH to become available on a libvirt domain.
 ///
-/// Polls SSH connectivity by attempting simple commands until successful or timeout.
+/// Uses the same `wait_for_readiness` polling loop as the ephemeral path
+/// and `run_ssh_impl`, just with a longer timeout for initial VM boot.
 fn wait_for_ssh_ready(
     global_opts: &crate::libvirt::LibvirtOptions,
     domain_name: &str,
@@ -362,39 +387,36 @@ fn wait_for_ssh_ready(
         domain_name, timeout_secs
     );
 
-    // Create progress bar
+    // Do expensive setup once: verify domain, extract SSH config, create temp key.
+    let ssh_opts = crate::libvirt::ssh::LibvirtSshOpts {
+        domain_name: domain_name.to_string(),
+        user: "root".to_string(),
+        command: vec![],
+        strict_host_keys: false,
+        timeout: 5,
+        log_level: "ERROR".to_string(),
+        extra_options: vec![],
+        suppress_output: true,
+    };
+    ssh_opts.verify_domain_running(global_opts)?;
+    let ssh_config = ssh_opts.extract_ssh_config(global_opts)?;
+    let (temp_key, parsed_extra_options) = ssh_opts.prepare_ssh_session(&ssh_config)?;
+
     let pb = crate::boot_progress::create_boot_progress_bar();
-    pb.set_message("Waiting for SSH to become available...");
-
-    // Clone values for closure
-    let global_opts_clone = global_opts.clone();
-    let domain_name_clone = domain_name.to_string();
-
-    // Use shared polling function with libvirt-specific test
     let (_elapsed, pb) = crate::utils::wait_for_readiness(
         pb,
         "Waiting for SSH",
         || {
-            // Create a test SSH connection with short timeout
-            let ssh_opts = crate::libvirt::ssh::LibvirtSshOpts {
-                domain_name: domain_name_clone.clone(),
-                user: "root".to_string(),
-                command: vec!["true".to_string()], // Simple command to test connectivity
-                strict_host_keys: false,
-                timeout: 5, // Short timeout for each attempt
-                log_level: "ERROR".to_string(),
-                extra_options: vec![],
-                suppress_output: true, // Suppress error messages during connectivity testing
-            };
-
-            // Try to connect
-            match crate::libvirt::ssh::run_ssh_impl(&global_opts_clone, ssh_opts) {
-                Ok(_) => Ok(true),
-                Err(_) => Ok(false),
+            let mut test_cmd =
+                ssh_opts.build_ssh_command(&ssh_config, &temp_key, parsed_extra_options.clone());
+            test_cmd.arg("--").arg("true");
+            match test_cmd.output() {
+                Ok(output) if output.status.success() => Ok(true),
+                _ => Ok(false),
             }
         },
         Duration::from_secs(timeout_secs),
-        Duration::from_secs(2), // Poll every 2 seconds
+        Duration::from_secs(2),
     )?;
 
     pb.finish_and_clear();
@@ -407,6 +429,16 @@ pub fn run(global_opts: &crate::libvirt::LibvirtOptions, mut opts: LibvirtRunOpt
 
     // Validate labels don't contain commas
     opts.validate_labels()?;
+
+    // Validate --log-dir early (before any expensive work).
+    if let Some(ref ld) = opts.log_dir {
+        if !ld.path.is_absolute() {
+            return Err(color_eyre::eyre::eyre!(
+                "--log-dir PATH must be absolute: {:?}",
+                ld.path
+            ));
+        }
+    }
 
     let connect_uri = global_opts.connect.as_deref();
     let lister = match global_opts.connect.as_ref() {
@@ -1201,6 +1233,9 @@ fn create_libvirt_domain_from_disk(
         domain_builder =
             domain_builder.with_firmware_log(crate::libvirt::domain::FirmwareLogOutput::Console);
     }
+    if opts.graphical_console {
+        domain_builder = domain_builder.with_graphical_console();
+    }
     domain_builder = domain_builder
         .with_metadata("bootc:source-image", &opts.image)
         .with_metadata("bootc:memory-mb", &memory.to_string())
@@ -1413,6 +1448,44 @@ fn create_libvirt_domain_from_disk(
         smbios_creds.push(dropin_cred);
     }
 
+    // Validate and record the journal log file path if requested via --log-dir.
+    // For libvirt we only support target=file:, not stdout (there is no persistent
+    // bcvk process to relay the stream; QEMU writes directly to the file via chardev).
+    // Journal output is always JSON when writing to a file (libvirt only supports file).
+    let journal_file_path: Option<std::path::PathBuf> = if let Some(path) =
+        opts.log_dir.as_ref().and_then(|d| d.journal_path())
+    {
+        // Validate parent directory exists before handing off to libvirt.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                return Err(color_eyre::eyre::eyre!(
+                    "--log-dir journal parent directory does not exist: {parent:?}"
+                ));
+            }
+        }
+        // Inject SMBIOS credentials for both streaming units (real-root + initrd).
+        let encoded_unit =
+            data_encoding::BASE64.encode(crate::run_ephemeral::JOURNAL_STREAM_UNIT.as_bytes());
+        smbios_creds.push(format!(
+            "io.systemd.credential.binary:systemd.extra-unit.bcvk-journal-stream.service={encoded_unit}"
+        ));
+        let encoded_unit_initrd = data_encoding::BASE64
+            .encode(crate::run_ephemeral::JOURNAL_STREAM_INITRD_UNIT.as_bytes());
+        smbios_creds.push(format!(
+            "io.systemd.credential.binary:systemd.extra-unit.bcvk-journal-stream-initrd.service={encoded_unit_initrd}"
+        ));
+        let journal_dropin =
+            "[Unit]\nWants=bcvk-journal-stream.service bcvk-journal-stream-initrd.service\n";
+        let encoded_dropin = data_encoding::BASE64.encode(journal_dropin.as_bytes());
+        smbios_creds.push(format!(
+            "io.systemd.credential.binary:systemd.unit-dropin.sysinit.target~bcvk-journal={encoded_dropin}"
+        ));
+        debug!("Injected journal streaming unit credentials (file={path:?})");
+        Some(path)
+    } else {
+        None
+    };
+
     let mut qemu_args = Vec::new();
 
     // Build QEMU args with all SMBIOS credentials
@@ -1435,6 +1508,30 @@ fn create_libvirt_domain_from_disk(
     for extra_cred in &opts.extra_smbios_credentials {
         qemu_args.push("-smbios".to_string());
         qemu_args.push(format!("type=11,value={}", extra_cred));
+    }
+
+    // If journal output was requested, configure the DomainBuilder to emit a
+    // <channel type='file'> element.  Libvirt attaches it to the existing
+    // virtio-serial controller (created implicitly for the virtio console), so
+    // no extra QEMU args are needed.
+    if let Some(ref jpath) = journal_file_path {
+        let path_str = jpath
+            .to_str()
+            .ok_or_else(|| color_eyre::eyre::eyre!("journal file path is not valid UTF-8"))?;
+        domain_builder = domain_builder.with_journal_channel_file(path_str);
+        debug!("Added journal channel file → {path_str}");
+
+        // Also wire up the initrd journal channel (journal-initrd.json).
+        let initrd_path = opts
+            .log_dir
+            .as_ref()
+            .and_then(|d| d.journal_initrd_path())
+            .expect("journal_initrd_path always Some when journal_path is Some");
+        let initrd_path_str = initrd_path
+            .to_str()
+            .ok_or_else(|| color_eyre::eyre::eyre!("journal-initrd path is not valid UTF-8"))?;
+        domain_builder = domain_builder.with_journal_initrd_channel_file(initrd_path_str);
+        debug!("Added journal-initrd channel file → {initrd_path_str}");
     }
 
     // Build netdev user mode networking with port forwarding
@@ -1461,6 +1558,71 @@ fn create_libvirt_domain_from_disk(
     qemu_args.push(netdev_config);
     qemu_args.push("-device".to_string());
     qemu_args.push("virtio-net-pci,netdev=ssh0,addr=0x3".to_string());
+
+    // Helper closure: resolve to absolute path, guard against directory, pre-create.
+    // QEMU's chardev logfile= requires the file to exist before the domain starts.
+    let resolve_log_path = |log_path: &Utf8Path, flag: &str| -> Result<Utf8PathBuf> {
+        let raw_parent = log_path.parent().unwrap_or(Utf8Path::new("."));
+        let effective_parent = if raw_parent.as_str().is_empty() {
+            Utf8Path::new(".")
+        } else {
+            raw_parent
+        };
+        let parent = effective_parent
+            .canonicalize_utf8()
+            .with_context(|| format!("{flag} parent directory not found: {log_path}"))?;
+        let abs = parent.join(log_path.file_name().unwrap_or(log_path.as_str()));
+        if abs.is_dir() {
+            eyre::bail!("{flag} path is a directory: {abs}");
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&abs)
+            .with_context(|| format!("create {flag} log file {abs}"))?;
+        Ok(abs)
+    };
+
+    // --log-dir=console=DIR takes precedence over the legacy --console-log flag if
+    // both are somehow set; in practice only one will be provided.
+    let virtio_log_path: Option<Utf8PathBuf> = opts
+        .log_dir
+        .as_ref()
+        .and_then(|d| d.console_path())
+        .map(|p| {
+            Utf8PathBuf::try_from(p).map_err(|e| eyre!("console log path is not valid UTF-8: {e}"))
+        })
+        .transpose()?
+        .or_else(|| opts.console_log.clone());
+
+    let virtio_log = virtio_log_path
+        .as_deref()
+        .map(|p| resolve_log_path(p, "--log-dir/--console-log"))
+        .transpose()?;
+
+    let serial_log = opts
+        .platform_console_log
+        .as_deref()
+        .map(|p| resolve_log_path(p, "--platform-console-log"))
+        .transpose()?;
+
+    if let (Some(v), Some(s)) = (&virtio_log, &serial_log) {
+        if v == s {
+            eyre::bail!(
+                "--console-log and --platform-console-log cannot point to the same file \
+                 (QEMU opens each chardev logfile independently and returns EBUSY if both \
+                 paths are identical)"
+            );
+        }
+    }
+
+    if let Some(p) = &virtio_log {
+        domain_builder = domain_builder.with_virtio_console_log(p.as_str());
+    }
+    if let Some(p) = &serial_log {
+        domain_builder = domain_builder.with_serial_console_log(p.as_str());
+    }
 
     let domain_xml = domain_builder
         .with_qemu_args(qemu_args)

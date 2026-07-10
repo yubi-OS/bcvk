@@ -43,7 +43,7 @@ pub struct DomainBuilder {
     disk_path: Option<String>,
     transient_disk: bool, // Use transient disk with temporary overlay
     network: Option<String>,
-    vnc_port: Option<u16>,
+    graphical_console: bool,
     kernel_args: Option<String>,
     metadata: HashMap<String, String>,
     qemu_args: Vec<String>,
@@ -55,8 +55,12 @@ pub struct DomainBuilder {
     nvram_template: Option<String>, // Custom NVRAM template with enrolled keys
     nvram_format: Option<String>,   // Format of NVRAM template (raw, qcow2)
     firmware_log: Option<FirmwareLogOutput>, // OVMF debug log output via isa-debugcon
+    virtio_console_log: Option<String>, // Virtio console log file path (hvc0 — OS/journald)
+    serial_console_log: Option<String>, // Serial console log file path (ttyS0 — UEFI/bootloader)
     fw_cfg_entries: Vec<(String, String)>, // fw_cfg entries (name, file_path)
     ignition_disk_path: Option<String>, // Path to Ignition config for virtio-blk injection
+    journal_channel_file: Option<String>, // virtserialport "org.bcvk.journal" → host file (append)
+    journal_initrd_channel_file: Option<String>, // virtserialport "org.bcvk.journal.initrd" → host file (append)
 }
 
 impl Default for DomainBuilder {
@@ -76,7 +80,7 @@ impl DomainBuilder {
             disk_path: None,
             transient_disk: false,
             network: None,
-            vnc_port: None,
+            graphical_console: false,
             kernel_args: None,
             metadata: HashMap::new(),
             qemu_args: Vec::new(),
@@ -88,8 +92,12 @@ impl DomainBuilder {
             nvram_template: None,
             nvram_format: None,
             firmware_log: None,
+            virtio_console_log: None,
+            serial_console_log: None,
             fw_cfg_entries: Vec::new(),
             ignition_disk_path: None,
+            journal_channel_file: None,
+            journal_initrd_channel_file: None,
         }
     }
 
@@ -129,10 +137,9 @@ impl DomainBuilder {
         self
     }
 
-    /// Enable VNC on specified port
-    #[allow(dead_code)]
-    pub fn with_vnc(mut self, port: u16) -> Self {
-        self.vnc_port = Some(port);
+    /// Enable graphical console (SPICE) for virt-manager access
+    pub fn with_graphical_console(mut self) -> Self {
+        self.graphical_console = true;
         self
     }
 
@@ -208,6 +215,18 @@ impl DomainBuilder {
         self
     }
 
+    /// Log virtio console output (OS/journald on hvc0) to the given host file.
+    pub fn with_virtio_console_log(mut self, path: &str) -> Self {
+        self.virtio_console_log = Some(path.to_string());
+        self
+    }
+
+    /// Log serial console output (UEFI/bootloader on ttyS0) to the given host file.
+    pub fn with_serial_console_log(mut self, path: &str) -> Self {
+        self.serial_console_log = Some(path.to_string());
+        self
+    }
+
     /// Add a fw_cfg entry for passing config files to the guest
     ///
     /// This is used for Ignition config injection on x86_64/aarch64.
@@ -220,6 +239,22 @@ impl DomainBuilder {
     /// Set Ignition config disk path for virtio-blk injection (s390x/ppc64le)
     pub fn with_ignition_disk(mut self, disk_path: String) -> Self {
         self.ignition_disk_path = Some(disk_path);
+        self
+    }
+
+    /// Stream the guest's `org.bcvk.journal` virtserialport to a host file (append mode).
+    ///
+    /// Emits a `<channel type='file'>` element in the domain XML, which libvirt attaches
+    /// to the existing virtio-serial controller.  No extra QEMU args are needed.
+    pub fn with_journal_channel_file(mut self, path: &str) -> Self {
+        self.journal_channel_file = Some(path.to_string());
+        self
+    }
+
+    /// Stream the guest's `org.bcvk.journal.initrd` virtserialport to a host file (append mode).
+    /// Captures journal output from the initrd phase.
+    pub fn with_journal_initrd_channel_file(mut self, path: &str) -> Self {
+        self.journal_initrd_channel_file = Some(path.to_string());
         self
     }
 
@@ -441,15 +476,53 @@ impl DomainBuilder {
             }
         }
 
-        // Serial console, see https://libvirt.org/formatdomain.html#relationship-between-serial-ports-and-consoles
-        // We allocate a platform-specific default for early console stuff like bootloaders,
-        // and a platform-independent `hvc0` that can be referenced independently.
+        // Serial console (ttyS0) — platform firmware, bootloader, early kernel.
+        // Virtio console (hvc0) — platform-independent; OS and journald write here.
+        // Each chardev opens its logfile independently; giving both the same path
+        // causes QEMU to return EBUSY on the second open.
         writer.start_element("console", &[("type", "pty")])?;
+        if let Some(ref log_path) = self.serial_console_log {
+            writer.write_empty_element("log", &[("file", log_path.as_str()), ("append", "on")])?;
+        }
         writer.write_empty_element("target", &[("type", "serial")])?;
         writer.end_element("console")?;
+
         writer.start_element("console", &[("type", "pty")])?;
+        if let Some(ref log_path) = self.virtio_console_log {
+            writer.write_empty_element("log", &[("file", log_path.as_str()), ("append", "on")])?;
+        }
         writer.write_empty_element("target", &[("type", "virtio")])?;
         writer.end_element("console")?;
+
+        // Journal streaming channel: virtserialport named "org.bcvk.journal" backed by a
+        // host-side file in append mode.  Libvirt attaches this to the existing
+        // virtio-serial controller that it creates for the virtio console above.
+        if let Some(ref journal_path) = self.journal_channel_file {
+            writer.start_element("channel", &[("type", "file")])?;
+            writer.write_empty_element(
+                "source",
+                &[("path", journal_path.as_str()), ("append", "on")],
+            )?;
+            writer.start_element(
+                "target",
+                &[("type", "virtio"), ("name", "org.bcvk.journal")],
+            )?;
+            writer.end_element("target")?;
+            writer.end_element("channel")?;
+        }
+        if let Some(ref journal_initrd_path) = self.journal_initrd_channel_file {
+            writer.start_element("channel", &[("type", "file")])?;
+            writer.write_empty_element(
+                "source",
+                &[("path", journal_initrd_path.as_str()), ("append", "on")],
+            )?;
+            writer.start_element(
+                "target",
+                &[("type", "virtio"), ("name", "org.bcvk.journal.initrd")],
+            )?;
+            writer.end_element("target")?;
+            writer.end_element("channel")?;
+        }
 
         // Firmware debug log via isa-debugcon (x86_64 only)
         // This captures OVMF/EDK2 DEBUG() output on IO port 0x402, useful for
@@ -474,19 +547,23 @@ impl DomainBuilder {
             }
         }
 
-        // VNC graphics if enabled
-        if let Some(vnc_port) = self.vnc_port {
-            writer.write_empty_element(
-                "graphics",
-                &[
-                    ("type", "vnc"),
-                    ("port", &vnc_port.to_string()),
-                    ("listen", "127.0.0.1"),
-                ],
-            )?;
+        // Graphical console (SPICE) for virt-manager access
+        if self.graphical_console {
+            writer.start_element("graphics", &[("type", "spice"), ("autoport", "yes")])?;
+            writer.write_empty_element("listen", &[("type", "address")])?;
+            writer.end_element("graphics")?;
             writer.start_element("video", &[])?;
-            writer.write_empty_element("model", &[("type", "vga")])?;
+            writer.write_empty_element(
+                "model",
+                &[("type", "virtio"), ("heads", "1"), ("primary", "yes")],
+            )?;
             writer.end_element("video")?;
+            writer.start_element("channel", &[("type", "spicevmc")])?;
+            writer.write_empty_element(
+                "target",
+                &[("type", "virtio"), ("name", "com.redhat.spice.0")],
+            )?;
+            writer.end_element("channel")?;
         }
 
         // Virtiofs filesystems
@@ -633,15 +710,28 @@ mod tests {
     }
 
     #[test]
-    fn test_vnc_configuration() {
+    fn test_graphical_console_configuration() {
+        // Test with graphical console enabled
         let xml = DomainBuilder::new()
             .with_name("test")
-            .with_vnc(5901)
+            .with_graphical_console()
             .build_xml()
             .unwrap();
 
-        assert!(xml.contains("graphics type=\"vnc\" port=\"5901\""));
-        assert!(xml.contains("model type=\"vga\""));
+        assert!(xml.contains("graphics type=\"spice\" autoport=\"yes\""));
+        assert!(xml.contains("model type=\"virtio\" heads=\"1\" primary=\"yes\""));
+        assert!(xml.contains("channel type=\"spicevmc\""));
+        assert!(xml.contains("target type=\"virtio\" name=\"com.redhat.spice.0\""));
+
+        // Test without graphical console (default)
+        let xml_no_graphics = DomainBuilder::new()
+            .with_name("test-no-graphics")
+            .build_xml()
+            .unwrap();
+
+        assert!(!xml_no_graphics.contains("<graphics"));
+        assert!(!xml_no_graphics.contains("<video"));
+        assert!(!xml_no_graphics.contains("spicevmc"));
     }
 
     #[test]
@@ -818,5 +908,46 @@ mod tests {
         assert!(xml_ro.contains("<readonly/>"));
         assert!(xml_ro.contains("source dir=\"/host/storage\""));
         assert!(xml_ro.contains("target dir=\"hoststorage\""));
+    }
+
+    #[test]
+    fn test_domain_xml_console_log() {
+        let xml = DomainBuilder::new()
+            .with_name("test-console-log")
+            .with_memory(2048)
+            .with_vcpus(2)
+            .with_disk("/tmp/disk.raw")
+            .with_virtio_console_log("/var/log/virtio.log")
+            .with_serial_console_log("/var/log/serial.log")
+            .build_xml()
+            .unwrap();
+
+        // Serial log appears before <target type="serial"
+        assert_eq!(
+            xml.matches(r#"<log file="/var/log/serial.log" append="on"/>"#)
+                .count(),
+            1,
+            "expected exactly one serial log element in:\n{xml}"
+        );
+        let serial_log_pos = xml.find(r#"<log file="/var/log/serial.log""#).unwrap();
+        let serial_target_pos = xml.find(r#"<target type="serial""#).unwrap();
+        assert!(
+            serial_log_pos < serial_target_pos,
+            "serial log must precede serial target"
+        );
+
+        // Virtio log appears before <target type="virtio"
+        assert_eq!(
+            xml.matches(r#"<log file="/var/log/virtio.log" append="on"/>"#)
+                .count(),
+            1,
+            "expected exactly one virtio log element in:\n{xml}"
+        );
+        let virtio_log_pos = xml.find(r#"<log file="/var/log/virtio.log""#).unwrap();
+        let virtio_target_pos = xml.find(r#"<target type="virtio""#).unwrap();
+        assert!(
+            virtio_log_pos < virtio_target_pos,
+            "virtio log must precede virtio target"
+        );
     }
 }

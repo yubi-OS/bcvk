@@ -90,10 +90,7 @@ pub fn detect_yubikeys() -> Result<Vec<UsbHostDevice>> {
         found.push(UsbHostDevice {
             vendor_id: YUBICO_VENDOR_ID,
             product_id,
-            label: format!(
-                "YubiKey (0x1050:{:04x})",
-                product_id.unwrap_or(0)
-            ),
+            label: format!("YubiKey (0x1050:{:04x})", product_id.unwrap_or(0)),
         });
     }
     Ok(found)

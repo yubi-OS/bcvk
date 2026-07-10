@@ -12,7 +12,10 @@ use itest::TestResult;
 use scopeguard::defer;
 use xshell::cmd;
 
-use crate::{get_bck_command, get_test_image, shell, LIBVIRT_INTEGRATION_TEST_LABEL};
+use crate::{
+    check_journal_coverage, get_bck_command, get_test_image, poll_until, shell,
+    LIBVIRT_INTEGRATION_TEST_LABEL,
+};
 use bcvk::xml_utils::parse_xml_dom;
 
 /// Generate a random alphanumeric suffix for VM names to avoid collisions
@@ -265,7 +268,7 @@ fn test_libvirt_comprehensive_workflow() -> TestResult {
 
     // Test 5: Verify VM lifecycle (already running, test inspect)
     println!("Test 5: Verifying VM is running...");
-    let info = cmd!(sh, "virsh dominfo {domain_name}").read()?;
+    let info = cmd!(sh, "env LC_ALL=C virsh dominfo {domain_name}").read()?;
     assert!(
         info.contains("running") || info.contains("idle"),
         "Domain should be running"
@@ -277,7 +280,7 @@ fn test_libvirt_comprehensive_workflow() -> TestResult {
     let rm_test_domain = create_test_vm_and_assert("test-rm", &test_image)?;
 
     // Verify it's running
-    let rm_info = cmd!(sh, "virsh dominfo {rm_test_domain}").read()?;
+    let rm_info = cmd!(sh, "env LC_ALL=C virsh dominfo {rm_test_domain}").read()?;
     assert!(
         rm_info.contains("running") || rm_info.contains("idle"),
         "Test VM should be running before rm test"
@@ -338,7 +341,7 @@ fn test_libvirt_comprehensive_workflow() -> TestResult {
     println!("✓ Replaced VM exists with same name");
 
     // Verify it's a fresh VM (should be running)
-    let replaced_info = cmd!(sh, "virsh dominfo {replace_test_domain}").read()?;
+    let replaced_info = cmd!(sh, "env LC_ALL=C virsh dominfo {replace_test_domain}").read()?;
     assert!(
         replaced_info.contains("running") || replaced_info.contains("idle"),
         "Replaced VM should be running"
@@ -491,7 +494,7 @@ fn test_libvirt_run_vm_lifecycle() -> TestResult {
     };
 
     // Verify domain is running (libvirt run starts the domain by default)
-    let info = cmd!(sh, "virsh dominfo {domain_name}").read()?;
+    let info = cmd!(sh, "env LC_ALL=C virsh dominfo {domain_name}").read()?;
     assert!(info.contains("State:"), "Should show domain state");
     assert!(
         info.contains("running") || info.contains("idle"),
@@ -815,7 +818,7 @@ fn test_libvirt_run_transient_vm() -> TestResult {
 
     // Verify domain is transient using virsh dominfo
     println!("Verifying domain is marked as transient...");
-    let dominfo = cmd!(sh, "virsh dominfo {domain_name}").read()?;
+    let dominfo = cmd!(sh, "env LC_ALL=C virsh dominfo {domain_name}").read()?;
     println!("Domain info:\n{}", dominfo);
 
     // Verify "Persistent: no" appears in dominfo
@@ -933,7 +936,7 @@ fn test_libvirt_run_transient_replace() -> TestResult {
     let sh = shell()?;
 
     // Verify domain is transient
-    let dominfo = cmd!(sh, "virsh dominfo {domain_name}").read()?;
+    let dominfo = cmd!(sh, "env LC_ALL=C virsh dominfo {domain_name}").read()?;
     assert!(
         dominfo.contains("Persistent:") && dominfo.contains("no"),
         "Domain should be transient. dominfo: {}",
@@ -951,7 +954,7 @@ fn test_libvirt_run_transient_replace() -> TestResult {
     println!("✓ Successfully replaced transient domain");
 
     // Verify the new domain exists and is transient
-    let dominfo = cmd!(sh, "virsh dominfo {domain_name}").read()?;
+    let dominfo = cmd!(sh, "env LC_ALL=C virsh dominfo {domain_name}").read()?;
     assert!(
         dominfo.contains("Persistent:") && dominfo.contains("no"),
         "Replaced domain should still be transient. dominfo: {}",
@@ -1122,3 +1125,79 @@ fn test_libvirt_run_bind_mounts() -> TestResult {
     Ok(())
 }
 integration_test!(test_libvirt_run_bind_mounts);
+
+/// Test --console-log: boots a VM with a log path, then verifies the file is
+/// non-empty and the domain XML contains the expected <log> element.
+fn test_libvirt_run_console_log() -> TestResult {
+    let sh = shell()?;
+    let bck = get_bck_command()?;
+    let test_image = get_test_image();
+    let label = LIBVIRT_INTEGRATION_TEST_LABEL;
+
+    let domain_name = format!("test-console-log-{}", random_suffix());
+    let log_file = tempfile::NamedTempFile::new()?;
+    let log_path = log_file.path().to_str().expect("log path is not UTF-8");
+
+    cleanup_domain(&domain_name);
+    defer! { cleanup_domain(&domain_name); }
+
+    cmd!(
+        sh,
+        "{bck} libvirt run --name {domain_name} --label {label} --filesystem ext4 --ssh-wait --karg=console=hvc0 --karg=systemd.journald.forward_to_console=1 --console-log {log_path} {test_image}"
+    )
+    .run()?;
+
+    // console=hvc0 makes /dev/console point to hvc0; forward_to_console=1
+    // then routes journald output there. "systemd" appears in every boot.
+    let log_content = std::fs::read_to_string(log_file.path())?;
+    assert!(log_content.contains("systemd"));
+
+    // virsh dumpxml uses single-quoted attributes: append='on'
+    let sh = shell()?;
+    let domain_xml = cmd!(sh, "virsh dumpxml {domain_name}").read()?;
+    let expected_log = format!("<log file='{}' append='on'/>", log_path);
+    assert!(domain_xml.contains(&expected_log));
+
+    Ok(())
+}
+integration_test!(test_libvirt_run_console_log);
+/// Test `--log-dir=journal=DIR` for libvirt VMs.
+///
+/// Boots a VM with `--log-dir=journal=DIR`, waits for SSH (proving the VM has reached
+/// multi-user.target), then polls `journal.json` until it contains early-boot entries,
+/// confirming initrd journal capture is working.
+fn test_libvirt_run_journal_output() -> TestResult {
+    let sh = shell()?;
+    let bck = get_bck_command()?;
+    let test_image = get_test_image();
+    let label = LIBVIRT_INTEGRATION_TEST_LABEL;
+
+    let domain_name = format!("test-journal-out-{}", random_suffix());
+    let log_dir = tempfile::tempdir()?;
+    let log_dir_path = log_dir
+        .path()
+        .to_str()
+        .expect("log dir path is not UTF-8")
+        .to_owned();
+
+    cleanup_domain(&domain_name);
+    defer! { cleanup_domain(&domain_name); }
+
+    cmd!(
+        sh,
+        "{bck} libvirt run --name {domain_name} --label {label} --filesystem ext4 --ssh-wait --log-dir=journal={log_dir_path} {test_image}"
+    )
+    .run()?;
+
+    // --ssh-wait guarantees multi-user.target was reached, but bcvk-journal-stream
+    // may still be flushing.  Poll until check_journal_coverage passes.
+    poll_until(
+        "journal coverage (journal.json + journal-initrd.json)",
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_millis(500),
+        || Ok(check_journal_coverage(log_dir.path()).is_ok()),
+    )?;
+
+    Ok(())
+}
+integration_test!(test_libvirt_run_journal_output);

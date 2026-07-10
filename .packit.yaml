@@ -40,6 +40,8 @@ jobs:
       - centos-stream-10-aarch64
       - fedora-43-x86_64
       - fedora-43-aarch64
+      - fedora-44-x86_64
+      - fedora-44-aarch64
       - fedora-rawhide-x86_64
       - fedora-rawhide-aarch64
 
@@ -56,8 +58,9 @@ jobs:
     dist_git_branches: &dist_git_branches
       - fedora-all
       - epel9
-      - epel10.1
+      - epel10
       - epel10.2
+      - epel10.3
 
   - job: koji_build
     trigger: commit

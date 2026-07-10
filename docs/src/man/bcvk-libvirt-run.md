@@ -150,6 +150,10 @@ Run a bootable container as a persistent VM
 
     User-defined labels for organizing VMs (comma not allowed in labels)
 
+**--graphical-console**
+
+    Enable graphical console (SPICE) for virt-manager access
+
 **--transient**
 
     Create a transient VM that disappears on shutdown/reboot
@@ -157,6 +161,18 @@ Run a bootable container as a persistent VM
 **--ignition**=*IGNITION_CONFIG*
 
     Path to Ignition config file (JSON format) for first-boot provisioning
+
+**--console-log**=*CONSOLE_LOG*
+
+    Log virtio console (OS/journald on hvc0) to this file (created if absent)
+
+**--platform-console-log**=*PLATFORM_CONSOLE_LOG*
+
+    Log platform console (UEFI/bootloader on ttyS0) to this file (created if absent)
+
+**--log-dir**=*STREAMS=DIR*
+
+    Write VM log streams to files in DIR
 
 <!-- END GENERATED OPTIONS -->
 
@@ -185,6 +201,23 @@ Create a VM and automatically SSH into it:
 Create a VM with access to host container storage for bootc upgrade:
 
     bcvk libvirt run --name upgrade-test --bind-storage-ro quay.io/fedora/fedora-bootc:42
+
+Capture the virtio console (OS/journald output) to a log file.  The
+`console=hvc0` kernel argument is required so that the kernel maps
+`/dev/console` to `hvc0`; without it journald's `forward_to_console`
+output goes to the serial console (`ttyS0`) instead:
+
+    bcvk libvirt run --name testvm \
+        --karg=console=hvc0 \
+        --karg=systemd.journald.forward_to_console=1 \
+        --console-log /var/home/user/vm-console.log \
+        quay.io/fedora/fedora-bootc:42
+
+Capture the platform console (UEFI/GRUB/serial) separately:
+
+    bcvk libvirt run --name testvm \
+        --platform-console-log /var/home/user/vm-serial.log \
+        quay.io/fedora/fedora-bootc:42
 
 Server management workflow:
 

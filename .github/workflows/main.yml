@@ -6,18 +6,22 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+  merge_group:
 
 env:
   # Something seems to be setting this in the default GHA runners, which breaks bcvk
   # as the default runner user doesn't have access
   LIBVIRT_DEFAULT_URI: "qemu:///session"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,7 +36,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup bootc Ubuntu environment
         uses: bootc-dev/actions/bootc-ubuntu-setup@main
@@ -68,14 +72,14 @@ jobs:
           BCVK_ALL_IMAGES: ${{ env.ALL_BASE_IMAGES }}
 
       - name: Upload nextest archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nextest-archive
           path: nextest-archive.tar.zst
           retention-days: 7
 
       - name: Upload bcvk binary for tests
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bcvk-binary-tests
           path: target/release/bcvk
@@ -86,7 +90,7 @@ jobs:
 
       - name: Upload bcvk binary artifacts
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bcvk-binary
           path: |
@@ -106,13 +110,13 @@ jobs:
       - name: Install ORAS CLI
         run: |
           # renovate: datasource=github-releases depName=oras-project/oras
-          VERSION=1.2.2
+          VERSION=1.3.2
           curl -LO https://github.com/oras-project/oras/releases/download/v${VERSION}/oras_${VERSION}_linux_amd64.tar.gz
           tar -xzf oras_${VERSION}_linux_amd64.tar.gz
           sudo mv oras /usr/local/bin/
 
       - name: Download bcvk binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: bcvk-binary
 
@@ -136,7 +140,7 @@ jobs:
         partition: [1, 2, 3, 4]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: bootc-dev/actions/bootc-ubuntu-setup@main
         with:
@@ -154,12 +158,12 @@ jobs:
         run: just pull-test-images
 
       - name: Download nextest archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextest-archive
 
       - name: Download bcvk binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: bcvk-binary-tests
           path: target/release
@@ -186,20 +190,26 @@ jobs:
 
       - name: Upload junit XML
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: integration-junit-xml-${{ matrix.partition }}
           path: target/nextest/integration/junit.xml
           retention-days: 7
 
-  # Sentinel job for required checks - configure this job name in repository settings
+  # Sentinel job for required checks - configure this job name in repository settings.
+  # Accepts 'skipped' as success so that merge_group-only jobs don't block PRs.
   required-checks:
     if: always()
     needs: [build-macos, build, integration-tests]
     runs-on: ubuntu-latest
     steps:
-      - run: exit 1
-        if: >-
-          needs.build-macos.result != 'success' ||
-          needs.build.result != 'success' ||
-          needs.integration-tests.result != 'success'
+      - name: Check all jobs
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          FAILED=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result | IN("success","skipped") | not) | .key')
+          if [ -n "$FAILED" ]; then
+            echo "The following jobs did not succeed: $FAILED"
+            exit 1
+          fi
+          echo "All jobs succeeded or were skipped."
