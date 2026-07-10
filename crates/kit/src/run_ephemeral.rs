@@ -587,6 +587,12 @@ fn prepare_run_command_with_temp(
         // Also needed for nested containers
         "--security-opt=seccomp=unconfined",
         "--security-opt=unmask=/proc/*",
+        // Ubuntu/AppArmor hosts (unlike Fedora/SELinux) still confine privileged
+        // containers via a default AppArmor profile even with --cap-add=all; that
+        // profile denies the mount-propagation syscalls bwrap needs when it builds
+        // its isolated mount namespace ("bwrap: Failed to make / slave: Permission
+        // denied"). Disable AppArmor confinement the same way SELinux is disabled above.
+        "--security-opt=apparmor=unconfined",
         // This is a general hardening thing to do when running privileged
         "-v",
         "/sys:/sys:ro",
