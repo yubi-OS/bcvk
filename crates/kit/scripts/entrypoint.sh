@@ -67,7 +67,9 @@ trap 'kill -TERM $BWRAP_PID 2>/dev/null; exit 0' INT TERM
 # Run bwrap in background so we can handle signals; xref
 # https://github.com/containers/bubblewrap/pull/586
 # But probably really we should switch to systemd
-bwrap --as-pid-1 --unshare-pid "${BWRAP_ARGS[@]}" --bind /run /run -- ${SELFEXE} container-entrypoint "$@" &
+# bcvk bind-mounts the extracted kernel inside this namespace; bwrap
+# drops caps by default, so keep CAP_SYS_ADMIN for that mount.
+bwrap --as-pid-1 --unshare-pid --cap-add CAP_SYS_ADMIN "${BWRAP_ARGS[@]}" --bind /run /run -- ${SELFEXE} container-entrypoint "$@" &
 BWRAP_PID=$!
 
 # Wait for bwrap to complete
