@@ -229,6 +229,11 @@ pub struct QemuConfig {
 
     /// fw_cfg entries for passing config files to the guest
     fw_cfg_entries: Vec<(String, Utf8PathBuf)>,
+    /// USB host devices to pass through into the VM (e.g. YubiKey).
+    ///
+    /// Each device is forwarded via QEMU `-device usb-host`. A single USB 2.0
+    /// EHCI controller is inserted automatically when this list is non-empty.
+    pub usb_host_devices: Vec<crate::usb_passthrough::UsbHostDevice>,
 }
 
 impl QemuConfig {
@@ -462,6 +467,15 @@ impl QemuConfig {
     /// The file will be accessible in the guest via the fw_cfg interface.
     pub fn add_fw_cfg(&mut self, name: String, file_path: Utf8PathBuf) -> &mut Self {
         self.fw_cfg_entries.push((name, file_path));
+        self
+    }
+
+    /// Add a USB host device to pass through into the VM.
+    ///
+    /// A single QEMU USB 2.0 EHCI controller is inserted automatically
+    /// the first time this list becomes non-empty.
+    pub fn add_usb_host_device(&mut self, dev: crate::usb_passthrough::UsbHostDevice) -> &mut Self {
+        self.usb_host_devices.push(dev);
         self
     }
 }
@@ -757,6 +771,13 @@ fn spawn(
     // Add fw_cfg entries
     for (name, file_path) in &config.fw_cfg_entries {
         cmd.args(["-fw_cfg", &format!("name={},file={}", name, file_path)]);
+    }
+
+    // USB host device passthrough (e.g. YubiKey)
+    if !config.usb_host_devices.is_empty() {
+        for arg in crate::usb_passthrough::qemu_usb_args(&config.usb_host_devices) {
+            cmd.arg(arg);
+        }
     }
 
     // Configure stdio based on display mode
