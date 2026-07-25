@@ -30,7 +30,7 @@
 use std::os::unix::fs::FileTypeExt;
 
 use camino::Utf8PathBuf;
-use color_eyre::eyre::{bail, eyre, Context};
+use color_eyre::eyre::{bail, Context};
 use color_eyre::Result;
 use tracing::{debug, info, warn};
 

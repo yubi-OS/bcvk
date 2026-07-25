@@ -312,8 +312,9 @@ fn main() -> Result<(), Report> {
                     println!("would-regenerate");
                 }
             }
-        Commands::NativeToDisk(opts) => native_to_disk::run(opts)?,
         }
+
+        Commands::NativeToDisk(opts) => native_to_disk::run(opts)?,
 
         #[cfg(target_os = "linux")]
         Commands::Libvirt { connect, command } => {
