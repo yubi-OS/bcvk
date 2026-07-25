@@ -456,6 +456,18 @@ pub struct CommonVmOpts {
     )]
     pub virtiofsd_binary: Option<String>,
 
+    #[clap(
+        long = "swtpm",
+        help = "Attach a software TPM 2.0 (swtpm) so /dev/tpm0 is present in the VM (test-only; CI without hardware)"
+    )]
+    pub swtpm: bool,
+
+    #[clap(
+        long = "swu2f",
+        help = "Load the uhid kernel module so an in-guest software FIDO2/U2F authenticator can expose /dev/uhid (test-only; CI without a physical YubiKey)"
+    )]
+    pub swu2f: bool,
+
     /// Select how VM output is presented.
     ///
     /// `console` (default): the VM's hvc0 console is forwarded to stdio.
@@ -837,6 +849,12 @@ fn prepare_run_command_with_temp(
         // Devices like /dev/kvm with group access need those groups propagated to the
         // container so commands in the container can use them
         "--group-add=keep-groups",
+        // Ubuntu/AppArmor hosts (unlike Fedora/SELinux) still confine privileged
+        // containers via a default AppArmor profile even with --cap-add=all; that
+        // profile denies the mount-propagation syscalls bwrap needs when it builds
+        // its isolated mount namespace ("bwrap: Failed to make / slave: Permission
+        // denied"). Disable AppArmor confinement the same way SELinux is disabled above.
+        "--security-opt=apparmor=unconfined",
         // This is a general hardening thing to do when running privileged
         "-v",
         "/sys:/sys:ro",
@@ -1736,7 +1754,23 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     }
 
     kernel_cmdline.extend(opts.kernel_args.clone());
+
+    // Software FIDO2/U2F (swu2f): QEMU cannot emulate a CTAP2 authenticator with the
+    // hmac-secret extension that systemd-cryptenroll requires, so the authenticator runs
+    // *inside* the guest over /dev/uhid. bcvk only ensures the uhid module is present.
+    if opts.common.swu2f {
+        bcvk_qemu::swu2f::push_uhid_kargs(&mut kernel_cmdline);
+    }
+
     qemu_config.set_kernel_cmdline(kernel_cmdline);
+
+    if opts.common.swtpm {
+        // swtpm control socket lives in the shared run dir; state in tmpfs.
+        qemu_config.enable_swtpm(
+            "/run/inner-shared/swtpm.sock".to_string(),
+            "/run/swtpm-state".to_string(),
+        );
+    }
 
     // Add Ignition config if specified
     // Different architectures require different methods (per FCOS docs):
@@ -2245,3 +2279,4 @@ mod tests {
         }
     }
 }
+

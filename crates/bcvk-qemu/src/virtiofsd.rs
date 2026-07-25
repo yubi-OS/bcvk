@@ -132,31 +132,41 @@ pub async fn spawn_virtiofsd_async(config: &VirtiofsConfig) -> Result<tokio::pro
     // but we want to be compatible with older virtiofsd too.
     cmd.arg("--inode-file-handles=fallback");
 
-    // Configure output redirection
-    if let Some(log_file) = &config.log_file {
-        // Create/open log file for both stdout and stderr
-        let tokio_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-            .await
-            .with_context(|| format!("Failed to open virtiofsd log file: {}", log_file))?;
+    // Configure output redirection.
+    //
+    // ALWAYS log to disk next to the socket, even when config.log_file is
+    // unset. Previously this fell back to Stdio::piped() with no log_file,
+    // and the failure path (spawn().wait_with_output() in qemu.rs) only
+    // reads that pipe *after* the process has already exited; if virtiofsd
+    // dies before its stdio buffers are read (e.g. very early exit), the
+    // captured stderr can come back empty even on a real crash, which is
+    // exactly the silent-rc=2 failure this replaces (yubi-OS/yubiOS #9/#20).
+    // A file survives independently of the reaping race and can be `cat`'d
+    // by the caller (or from a sibling exec into the same container) no
+    // matter how virtiofsd exits.
+    let effective_log_file = config
+        .log_file
+        .clone()
+        .unwrap_or_else(|| Utf8PathBuf::from(format!("{}.log", config.socket_path)));
 
-        let log_file_handle = tokio_file.into_std().await;
+    let tokio_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&effective_log_file)
+        .await
+        .with_context(|| format!("Failed to open virtiofsd log file: {}", effective_log_file))?;
 
-        // Clone for stderr
-        let stderr_handle = log_file_handle
-            .try_clone()
-            .with_context(|| "Failed to clone log file handle for stderr")?;
+    let log_file_handle = tokio_file.into_std().await;
 
-        cmd.stdout(std::process::Stdio::from(log_file_handle));
-        cmd.stderr(std::process::Stdio::from(stderr_handle));
+    // Clone for stderr
+    let stderr_handle = log_file_handle
+        .try_clone()
+        .with_context(|| "Failed to clone log file handle for stderr")?;
 
-        debug!("virtiofsd output will be logged to: {}", log_file);
-    } else {
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-    }
+    cmd.stdout(std::process::Stdio::from(log_file_handle));
+    cmd.stderr(std::process::Stdio::from(stderr_handle));
+
+    debug!("virtiofsd output will be logged to: {}", effective_log_file);
 
     let child = cmd.spawn().with_context(|| {
         format!(
@@ -166,8 +176,8 @@ pub async fn spawn_virtiofsd_async(config: &VirtiofsConfig) -> Result<tokio::pro
     })?;
 
     debug!(
-        "Spawned virtiofsd: binary={}, socket={}, shared_dir={}, debug={}, log_file={:?}",
-        &virtiofsd_binary, config.socket_path, config.shared_dir, config.debug, config.log_file
+        "Spawned virtiofsd: binary={}, socket={}, shared_dir={}, debug={}, log_file={}",
+        &virtiofsd_binary, config.socket_path, config.shared_dir, config.debug, effective_log_file
     );
 
     Ok(child)
