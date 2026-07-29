@@ -566,6 +566,15 @@ pub struct RunEphemeralOpts {
     pub kernel_args: Vec<String>,
 
     #[clap(
+        long = "extra-qemu-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        help = "Pass a raw argument straight through to QEMU (repeatable)"
+    )]
+    #[serde(default)]
+    pub extra_qemu_args: Vec<String>,
+
+    #[clap(
         long = "ignition",
         help = "Path to Ignition config file (JSON format) to inject via fw_cfg"
     )]
@@ -1916,6 +1925,10 @@ Options=
                 });
             }
         }
+    }
+
+    for arg in &opts.extra_qemu_args {
+        qemu_config.extra_qemu_args.push(arg.clone());
     }
 
     qemu_config.set_console(opts.common.console);

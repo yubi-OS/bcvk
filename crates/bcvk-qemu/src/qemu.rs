@@ -235,6 +235,10 @@ pub struct QemuConfig {
     /// EHCI controller is inserted automatically when this list is non-empty.
     pub usb_host_devices: Vec<crate::usb_passthrough::UsbHostDevice>,
 
+    /// Raw QEMU arguments appended verbatim to the emulator command line.
+    /// CI-only escape hatch (ci_test-vgpu-vm.yml attaches a virtio-gpu device).
+    pub extra_qemu_args: Vec<String>,
+
     /// Optional software TPM (swtpm) backing the QEMU emulator TPM device.
     /// Test-only vTPM so `/dev/tpm0` is present in CI VMs without hardware.
     pub swtpm: Option<crate::swtpm::SwtpmConfig>,
@@ -799,6 +803,11 @@ fn spawn(
         for arg in crate::usb_passthrough::qemu_usb_args(&config.usb_host_devices) {
             cmd.arg(arg);
         }
+    }
+
+    // Raw pass-through QEMU arguments (CI vGPU device attach).
+    for arg in &config.extra_qemu_args {
+        cmd.arg(arg);
     }
 
     // Configure stdio based on display mode
