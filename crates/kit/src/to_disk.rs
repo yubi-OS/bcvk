@@ -534,6 +534,7 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
     // - Attach target disk via virtio-blk
     // - Disable networking (using local storage only)
     let ephemeral_opts = RunEphemeralOpts {
+        extra_qemu_args: Vec::new(),
         host_dns_servers: None,
         image: opts.get_installer_image().to_string(),
         common: common_opts,

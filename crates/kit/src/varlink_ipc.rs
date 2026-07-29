@@ -245,6 +245,7 @@ impl BcvkService {
                 .transpose()?;
 
             let run_opts = RunEphemeralOpts {
+                extra_qemu_args: Vec::new(),
                 image,
                 common: CommonVmOpts {
                     itype,
