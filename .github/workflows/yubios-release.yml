@@ -92,12 +92,12 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           SRC_SHA="$(git rev-parse HEAD)"
+          printf '%s\n\n%s\n\n%s\n' \
+            "yubios fork release of bcvk, minted from pinned source commit \`${SRC_SHA}\` (the yubi-OS/yubiOS PINNED.md bcvk pin)." \
+            "Scheme: upstream base v0.18.0 + yubios patch set (see RELEASING.md). Built unsigned: the org has no fork release signing key yet; gap tracked in OMN-105." \
+            "Assets: bcvk-amd64, bcvk-arm64 (bare binaries), bcvk (amd64 compatibility copy), SHA256SUMS." > notes.md
           gh release create "$TAG" \
             --title "bcvk $TAG" \
             --verify-tag \
-            --notes "yubios fork release of bcvk, minted from pinned source commit \`$SRC_SHA\` (the yubi-OS/yubiOS PINNED.md bcvk pin).
-
-Scheme: upstream base v0.18.0 + yubios patch set (see RELEASING.md). Built unsigned: the org has no fork release signing key yet; gap tracked in OMN-105.
-
-Assets: bcvk-amd64, bcvk-arm64 (bare binaries), bcvk (amd64 compatibility copy), SHA256SUMS." \
+            --notes-file notes.md \
             bcvk bcvk-amd64 bcvk-arm64 SHA256SUMS
