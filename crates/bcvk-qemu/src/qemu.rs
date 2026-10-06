@@ -27,6 +27,8 @@ use crate::VirtiofsConfig;
 /// The device path for vsock allocation.
 pub const VHOST_VSOCK: &str = "/dev/vhost-vsock";
 
+const SYSTEMD_CREDENTIAL_FW_CFG_PREFIX: &str = "opt/io.systemd.credentials/";
+
 /// VirtIO-FS mount point configuration.
 #[derive(Debug, Clone)]
 pub struct VirtiofsMount {
@@ -495,6 +497,19 @@ impl QemuConfig {
         self.usb_host_devices.push(dev);
         self
     }
+
+    /// Pass a systemd system credential through QEMU's fw_cfg interface.
+    /// Only the file path, not its contents, appears in QEMU's arguments.
+    pub fn add_systemd_credential_file(
+        &mut self,
+        credential_name: &str,
+        file_path: Utf8PathBuf,
+    ) -> &mut Self {
+        self.add_fw_cfg(
+            format!("{SYSTEMD_CREDENTIAL_FW_CFG_PREFIX}{credential_name}"),
+            file_path,
+        )
+    }
 }
 
 /// Allocate a unique VSOCK CID.
@@ -536,6 +551,63 @@ fn allocate_vsock_cid(vhost_fd: File) -> Result<(OwnedFd, u32)> {
     Err(eyre!("Could not find available VSOCK CID (tried 3-10000)"))
 }
 
+/// Resolve the QEMU executable used to launch the VM.
+fn qemu_binary() -> Result<String> {
+    std::env::var("QEMU_BIN")
+        .ok()
+        .map(Ok)
+        .unwrap_or_else(|| -> Result<_> {
+            // RHEL only supports non-emulated, and qemu is an implementation detail
+            // of higher level virt.
+            let libexec_qemu = Utf8Path::new("/usr/libexec/qemu-kvm");
+            if libexec_qemu.try_exists()? {
+                Ok(libexec_qemu.to_string())
+            } else {
+                let arch = std::env::consts::ARCH;
+                Ok(format!("qemu-system-{arch}"))
+            }
+        })
+        .context("Checking for qemu")
+}
+
+/// Parse the major, minor, and patch version from QEMU's `--version` output.
+fn parse_qemu_version(output: &str) -> Option<(u32, u32, u32)> {
+    let version = output
+        .lines()
+        .next()?
+        .strip_prefix("QEMU emulator version ")?
+        .split_whitespace()
+        .next()?;
+    let numeric = version.split_once('-').map_or(version, |(base, _)| base);
+    let mut parts = numeric.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Query the version of the same QEMU executable used to launch VMs.
+pub fn qemu_version() -> Result<Option<(u32, u32, u32)>> {
+    let binary = qemu_binary()?;
+    let output = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("Checking version of {binary}"))?;
+    if !output.status.success() {
+        warn!("Could not get {binary} version");
+        return Ok(None);
+    }
+    let version_output = String::from_utf8_lossy(&output.stdout);
+    let version = parse_qemu_version(&version_output);
+    if version.is_none() {
+        warn!("Could not parse {binary} version");
+    }
+    Ok(version)
+}
+
 /// Spawn QEMU VM process with given configuration and optional extra credential.
 /// Uses KVM acceleration, memory-backend-memfd for VirtIO-FS compatibility.
 fn spawn(
@@ -551,23 +623,7 @@ fn spawn(
         config.memory_mb
     );
 
-    let qemu = std::env::var("QEMU_BIN")
-        .ok()
-        .map(Ok)
-        .unwrap_or_else(|| -> Result<_> {
-            // RHEL only supports non-emulated, and qemu is an implementation detail
-            // of higher level virt.
-            let libexec_qemu = Utf8Path::new("/usr/libexec/qemu-kvm");
-            if libexec_qemu.try_exists()? {
-                Ok(libexec_qemu.to_string())
-            } else {
-                let arch = std::env::consts::ARCH;
-                Ok(format!("qemu-system-{arch}"))
-            }
-        })
-        .context("Checking for qemu")?;
-
-    let mut cmd = Command::new(qemu);
+    let mut cmd = Command::new(qemu_binary()?);
     // SAFETY: This API is safe to call in a forked child.
     #[allow(unsafe_code)]
     unsafe {
@@ -1101,6 +1157,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_qemu_version() {
+        for (output, expected) in [
+            (
+                "QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)",
+                Some((10, 2, 2)),
+            ),
+            ("QEMU emulator version 11.0.0", Some((11, 0, 0))),
+            ("QEMU emulator version 11.1.0", Some((11, 1, 0))),
+            ("QEMU emulator version 12.0.0", Some((12, 0, 0))),
+            ("QEMU emulator version unknown", None),
+            ("not a QEMU version", None),
+        ] {
+            assert_eq!(parse_qemu_version(output), expected);
+        }
+    }
+
+    #[test]
     fn test_virtio_serial_device_creation() {
         let mut config = QemuConfig::new_direct_boot(
             1024,
@@ -1153,11 +1226,17 @@ mod tests {
             "opt/com.coreos/config".to_string(),
             "/test/ignition.json".into(),
         );
+        config.add_systemd_credential_file("tmpfiles.extra", "/test/ssh-credential".into());
 
         // Test that the fw_cfg entry is created correctly
-        assert_eq!(config.fw_cfg_entries.len(), 1);
+        assert_eq!(config.fw_cfg_entries.len(), 2);
         assert_eq!(config.fw_cfg_entries[0].0, "opt/com.coreos/config");
         assert_eq!(config.fw_cfg_entries[0].1.as_str(), "/test/ignition.json");
+        assert_eq!(
+            config.fw_cfg_entries[1].0,
+            "opt/io.systemd.credentials/tmpfiles.extra"
+        );
+        assert_eq!(config.fw_cfg_entries[1].1.as_str(), "/test/ssh-credential");
     }
 }
 

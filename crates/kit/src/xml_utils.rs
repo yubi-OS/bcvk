@@ -7,6 +7,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use color_eyre::{eyre::eyre, Result};
+use quick_xml::escape::unescape;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::reader::Reader;
 use quick_xml::writer::Writer;
@@ -167,13 +168,13 @@ pub fn parse_xml_dom(xml: &str) -> Result<XmlNode> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let name = e.name().into_inner().to_owned();
                 let mut attributes = HashMap::new();
 
                 for attr in e.attributes() {
                     if let Ok(attr) = attr {
-                        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-                        let value = String::from_utf8_lossy(&attr.value).into_owned();
+                        let key = attr.key.into_inner().to_owned();
+                        let value = attr.value.into_owned();
                         attributes.insert(key, value);
                     }
                 }
@@ -188,13 +189,13 @@ pub fn parse_xml_dom(xml: &str) -> Result<XmlNode> {
                 stack.push(node);
             }
             Ok(Event::Empty(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let name = e.name().into_inner().to_owned();
                 let mut attributes = HashMap::new();
 
                 for attr in e.attributes() {
                     if let Ok(attr) = attr {
-                        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-                        let value = String::from_utf8_lossy(&attr.value).into_owned();
+                        let key = attr.key.into_inner().to_owned();
+                        let value = attr.value.into_owned();
                         attributes.insert(key, value);
                     }
                 }
@@ -223,7 +224,7 @@ pub fn parse_xml_dom(xml: &str) -> Result<XmlNode> {
                 }
             }
             Ok(Event::Text(e)) => {
-                if let Ok(text) = e.unescape() {
+                if let Ok(text) = unescape(&e) {
                     if let Some(current) = stack.last_mut() {
                         current.text.push_str(&text);
                     }

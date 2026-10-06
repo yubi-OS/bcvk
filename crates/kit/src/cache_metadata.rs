@@ -49,6 +49,10 @@ struct CacheInputs {
     /// Whether to use composefs-native storage
     composefs_backend: bool,
 
+    /// Which bootloader to use for composefs backend
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootloader: Option<String>,
+
     /// Kernel arguments used during installation
     kernel_args: Vec<String>,
 
@@ -78,6 +82,9 @@ pub struct DiskImageMetadata {
     /// Whether to use composefs-native storage
     pub composefs_backend: bool,
 
+    /// Which bootloader to use for composefs backend
+    pub bootloader: Option<String>,
+
     /// Kernel arguments used during installation
     pub kernel_args: Vec<String>,
 
@@ -95,6 +102,7 @@ impl DiskImageMetadata {
             filesystem: self.filesystem.clone(),
             root_size: self.root_size.clone(),
             composefs_backend: self.composefs_backend,
+            bootloader: self.bootloader.clone(),
             kernel_args: self.kernel_args.clone(),
             version: self.version,
         };
@@ -102,7 +110,14 @@ impl DiskImageMetadata {
         let json = serde_json::to_string(&inputs).expect("Failed to serialize cache inputs");
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
-        format!("sha256:{:x}", hasher.finalize())
+        format!(
+            "sha256:{}",
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
     }
 
     /// Write metadata to a file using extended attributes via rustix
@@ -184,6 +199,7 @@ impl DiskImageMetadata {
             root_size: options.root_size.clone(),
             kernel_args: options.karg.clone(),
             composefs_backend: options.composefs_backend,
+            bootloader: options.bootloader.clone(),
         }
     }
 }
@@ -342,6 +358,7 @@ mod tests {
             root_size: Some("20G".to_string()),
             kernel_args: vec!["console=ttyS0".to_string()],
             composefs_backend: false,
+            bootloader: Some("grub".to_string()),
             version: 1,
         };
 
@@ -353,6 +370,8 @@ mod tests {
         assert_eq!(inputs.filesystem, deserialized.filesystem);
         assert_eq!(inputs.root_size, deserialized.root_size);
         assert_eq!(inputs.kernel_args, deserialized.kernel_args);
+        assert_eq!(inputs.composefs_backend, deserialized.composefs_backend);
+        assert_eq!(inputs.bootloader, deserialized.bootloader);
         assert_eq!(inputs.version, deserialized.version);
         Ok(())
     }

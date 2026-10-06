@@ -18,7 +18,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            code:
+              - '!**/*.md'
+
   build-macos:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -33,7 +48,9 @@ jobs:
         run: cargo test --lib
 
   build:
-    runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@v7
@@ -110,7 +127,7 @@ jobs:
       - name: Install ORAS CLI
         run: |
           # renovate: datasource=github-releases depName=oras-project/oras
-          VERSION=1.3.3
+          VERSION=1.3.4
           curl -LO https://github.com/oras-project/oras/releases/download/v${VERSION}/oras_${VERSION}_linux_amd64.tar.gz
           tar -xzf oras_${VERSION}_linux_amd64.tar.gz
           sudo mv oras /usr/local/bin/
@@ -132,8 +149,9 @@ jobs:
           done
 
   integration-tests:
-    runs-on: ubuntu-24.04
-    needs: build
+    runs-on: ubuntu-26.04
+    needs: [changes, build]
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -200,7 +218,7 @@ jobs:
   # Accepts 'skipped' as success so that merge_group-only jobs don't block PRs.
   required-checks:
     if: always()
-    needs: [build-macos, build, integration-tests]
+    needs: [changes, build-macos, build, integration-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs

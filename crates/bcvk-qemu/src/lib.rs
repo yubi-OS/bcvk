@@ -56,8 +56,8 @@ pub use credentials::{
 };
 
 pub use qemu::{
-    BootMode, DiskFormat, DisplayMode, MachineType, NetworkMode, QemuConfig, ResourceLimits,
-    RunningQemu, VirtioBlkDevice, VirtioSerialOut, VirtiofsMount, VHOST_VSOCK,
+    qemu_version, BootMode, DiskFormat, DisplayMode, MachineType, NetworkMode, QemuConfig,
+    ResourceLimits, RunningQemu, VirtioBlkDevice, VirtioSerialOut, VirtiofsMount, VHOST_VSOCK,
 };
 
 pub use usb_passthrough::{
