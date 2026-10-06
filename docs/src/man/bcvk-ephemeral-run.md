@@ -67,6 +67,7 @@ This design allows bcvk to provide VM-like isolation and boot behavior while lev
 **--console**
 
     Connect the QEMU console to the container's stdio (visible via podman logs/attach)
+    Add **-i -t** to send keyboard input to the guest console.
 
 **--debug**
 
@@ -216,7 +217,7 @@ run and SSH into one command with automatic cleanup.
 
 **Debugging boot issues**:
 
-    bcvk ephemeral run --console --name debugvm localhost/mybootc
+    bcvk ephemeral run --console -it --name debugvm localhost/mybootc
 
 ## Understanding the Flags
 
@@ -369,6 +370,33 @@ Virtiofsd logs are helpful for:
 - Debugging filesystem access issues
 - Understanding file handle support warnings
 - Investigating mount-related errors
+
+## Podman Can't See bcvk's Filesystem
+
+To launch a VM, bcvk asks podman to bind-mount paths from its own
+filesystem, including its own binary. This requires podman to see the
+same filesystem as bcvk, which fails with an error like:
+
+    Podman command failed: Error: statfs /usr/bin/bcvk: no such file or directory
+
+This happens when bcvk runs inside a toolbox or distrobox container and
+podman is forwarded to the host instead of running in the container (for
+example via a `flatpak-spawn --host podman` wrapper or the podman
+socket), or when podman is a remote client. Paths that bcvk passes to
+podman are then resolved on podman's side, so a bcvk binary installed
+only in the toolbox can't be found there. bcvk detects this and adds a
+hint to the error explaining it.
+
+The fix is to install bcvk on the host alongside podman and QEMU and
+run it there. From a toolbox, invoke the host's copy with
+`flatpak-spawn --host bcvk ...`; from a distrobox, with
+`distrobox-host-exec bcvk ...`.
+
+Beware of version skew: if bcvk binaries exist at the same path on both
+the host and in the toolbox (e.g. both installed from packages), this
+error doesn't occur, but podman mounts the host's copy into the VM's
+container, which can differ in version from the one you ran. Keep them
+in sync, or install bcvk only on the host.
 
 # SEE ALSO
 

@@ -41,6 +41,8 @@ mod libvirt_upload_disk;
 #[allow(dead_code)]
 mod podman;
 #[cfg(target_os = "linux")]
+mod podman_hint;
+#[cfg(target_os = "linux")]
 mod qemu;
 #[cfg(target_os = "linux")]
 mod run_ephemeral;
@@ -115,6 +117,9 @@ pub enum StubEphemeralCommands {
     /// Run ephemeral VM and SSH into it
     #[clap(name = "run-ssh")]
     RunSsh,
+    /// Boot an ephemeral VM and check that systemd reaches the running state
+    #[clap(name = "test-basic")]
+    TestBasic,
     /// Connect to running VMs via SSH
     #[clap(name = "ssh")]
     Ssh,

@@ -15,7 +15,7 @@
 //! The execution follows this chain:
 //! 1. **Host Process**: `bcvk run-ephemeral` invoked on host
 //! 2. **Container Launch**: Podman privileged container with KVM and host mounts
-//! 3. **Namespace Setup**: bwrap creates isolated namespace with hybrid rootfs  
+//! 3. **Root Setup**: `mount` and `chroot` into the hybrid rootfs
 //! 4. **Binary Re-execution**: Same binary re-executes with `container-entrypoint`
 //! 5. **VM Launch**: QEMU starts with VirtioFS root and additional mounts
 //!
@@ -41,12 +41,12 @@
 //! └── [other dirs created empty for container compatibility]
 //! ```
 //!
-//! ### Phase 3: Namespace Isolation (bwrap)
-//! Uses bubblewrap to create isolated namespace:
-//! - New mount namespace with `/run/tmproot` as root
+//! ### Phase 3: Root Setup (mount + chroot)
+//! The container is already privileged with its own mount namespace, so no
+//! further namespaces are needed:
+//! - `/run`, `/proc`, `/dev` and `/var/tmp` mounted into `/run/tmproot`
 //! - Shared `/run/inner-shared` for virtiofsd socket communication
-//! - Proper `/proc`, `/dev`, `/tmp` mounts
-//! - Re-executes binary: `bwrap ... -- /run/selfexe container-entrypoint`
+//! - Re-executes binary: `exec chroot /run/tmproot /run/selfexe container-entrypoint`
 //!
 //! ### Phase 4: VM Execution (`run_impl`)
 //! - Runs inside the container after namespace setup
@@ -125,11 +125,19 @@ use crate::{
 /// fw_cfg name for Ignition configuration (per FCOS documentation)
 const IGNITION_FW_CFG_NAME: &str = "opt/com.coreos/config";
 
+const SSH_CREDENTIAL_PATH: &str = "/run/qemu/ssh-credential";
+
 /// virtio-blk serial name for Ignition configuration (per FCOS documentation)
 const IGNITION_SERIAL_NAME: &str = "ignition";
 
 /// Mount path for Ignition config inside the container
 const IGNITION_CONFIG_MOUNT_PATH: &str = "/run/ignition-config.json";
+
+/// Kernel initramfs magic marker for bootconfig trailer.
+const BOOTCONFIG_MAGIC: &[u8; 12] = b"#BOOTCONFIG\n";
+
+/// Linux's LINUX_PE_MAGIC at offset 0x38 in an EFI bootable kernel image.
+const LINUX_PE_MAGIC: [u8; 4] = 0x8182_23cd_u32.to_le_bytes();
 
 // ---------------------------------------------------------------------------
 // Journal / output mode types
@@ -639,7 +647,8 @@ pub fn run_detached(opts: RunEphemeralOpts) -> Result<String> {
     let output = cmd.output().context("Failed to execute podman command")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(color_eyre::eyre::eyre!("Podman command failed: {}", stderr));
+        let err = eyre!("Podman command failed: {}", stderr);
+        return Err(crate::podman_hint::with_podman_failure_hint(err, &stderr));
     }
 
     // Return the container ID from stdout
@@ -1141,12 +1150,15 @@ fn inject_systemd_units() -> Result<()> {
     fs::create_dir_all(&format!("{}/default.target.wants", target_units))?;
     fs::create_dir_all(&format!("{}/remote-fs.target.wants", target_units))?;
 
-    // Copy all .service and .mount files
+    // Copy all .service, .mount and .target files
     for entry in fs::read_dir(source_units)? {
         let entry = entry?;
         let path = entry.path();
         let extension = path.extension().map(|ext| ext.to_string_lossy());
-        if matches!(extension.as_deref(), Some("service") | Some("mount")) {
+        if matches!(
+            extension.as_deref(),
+            Some("service") | Some("mount") | Some("target")
+        ) {
             let filename = path.file_name().unwrap().to_string_lossy();
             let target_path = format!("{}/{}", target_units, filename);
             fs::copy(&path, &target_path)?;
@@ -1207,10 +1219,9 @@ fn parse_service_exit_code(status_content: &str) -> Result<i32> {
 /// not the guest bootc image that gets booted inside the VM.
 fn check_required_container_binaries() -> Result<()> {
     // systemctl: used for checking cloud-init and other systemd operations
-    // objcopy: for UKI kernel extraction (when using UKI images)
-    // NOTE: bwrap is checked earlier in entrypoint.sh, not here, because by the
-    // time run_impl() executes we're already inside the bwrap namespace
-    let required_binaries = ["systemctl", "objcopy"];
+    // NOTE: mount and chroot are checked earlier in entrypoint.sh, not here, because by the
+    // time run_impl() executes we're already inside the hybrid root
+    let required_binaries = ["systemctl"];
 
     let mut missing = Vec::new();
 
@@ -1225,6 +1236,59 @@ fn check_required_container_binaries() -> Result<()> {
     }
 
     debug!("All required container binaries found");
+    Ok(())
+}
+
+fn require_binary(binary: &str) -> Result<()> {
+    which::which(binary).map_err(|_| eyre!("Missing required executable: {binary}"))?;
+    Ok(())
+}
+
+/// Check if the file is a EFI kernel with zstd compression.
+fn is_zstd_efi_zboot(path: &str) -> Result<bool> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0u8; 60];
+    if file.metadata()?.len() < header.len() as u64 {
+        return Ok(false);
+    }
+    file.read_exact(&mut header)?;
+    Ok(&header[0..2] == b"MZ"
+        && &header[4..8] == b"zimg"
+        && &header[24..29] == b"zstd\0"
+        && header[56..60] == LINUX_PE_MAGIC)
+}
+
+fn qemu_supports_zstd_zboot() -> Result<bool> {
+    // QEMU 11.0 added zstd decompression to its EFI zboot loader.
+    Ok(qemu::qemu_version()?.is_some_and(|version| version >= (11, 0, 0)))
+}
+
+fn has_bootconfig_trailer(path: &str) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() < BOOTCONFIG_MAGIC.len() as u64 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-(BOOTCONFIG_MAGIC.len() as i64)))?;
+    let mut magic = [0u8; BOOTCONFIG_MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    Ok(&magic == BOOTCONFIG_MAGIC)
+}
+
+/// Remove a bootconfig trailer before modifying an initramfs. Without this,
+/// appending CPIO would leave the trailer in the middle of the initramfs.
+fn remove_bootconfig(initramfs: &str) -> Result<()> {
+    if !has_bootconfig_trailer(initramfs)? {
+        return Ok(());
+    }
+    require_binary("bootconfig")?;
+    Command::new("bootconfig")
+        .args(["-d", initramfs])
+        .run_capture_stderr()
+        .map_err(|e| eyre!("Removing bootconfig before appending initramfs units: {e}"))?;
     Ok(())
 }
 
@@ -1344,76 +1408,99 @@ pub(crate) async fn run_impl(opts: RunEphemeralOpts) -> Result<()> {
         .ok_or_else(|| {
             eyre!(
                 "No kernel found. Checked:\n\
+                 - /boot/aboot-*.img (ukiboot or Android boot)\n\
                  - /boot/EFI/Linux/*.efi (UKI)\n\
                  - /usr/lib/modules/<version>/<version>.efi (UKI)\n\
                  - /usr/lib/modules/<version>/vmlinuz + initramfs.img"
             )
         })?;
-
     // Add the source-image prefix to get absolute paths
     let kernel_info =
         crate::kernel::with_root_prefix(kernel_info, Utf8Path::new("/run/source-image"));
 
     debug!(
-        "Found kernel: {:?} (UKI: {})",
-        kernel_info.kernel_path, kernel_info.is_uki
+        "Found kernel: {:?} ({:?})",
+        kernel_info.kernel_path, kernel_info.kind
     );
 
     let kernel_mount = "/run/qemu/kernel";
     let initramfs_mount = "/run/qemu/initramfs";
 
-    // Extract from UKI if found, otherwise use traditional kernel
-    if kernel_info.is_uki {
-        debug!(
-            "Extracting kernel and initramfs from UKI: {:?}",
-            kernel_info.kernel_path
-        );
+    match kernel_info.kind {
+        crate::kernel::KernelKind::Uki => {
+            require_binary("objcopy")?;
+            debug!(
+                "Extracting kernel and initramfs from UKI: {:?}",
+                kernel_info.kernel_path
+            );
+            for (section, output) in [(".linux", kernel_mount), (".initrd", initramfs_mount)] {
+                Command::new("objcopy")
+                    .args([
+                        "--dump-section",
+                        &format!("{section}={output}"),
+                        kernel_info.kernel_path.as_str(),
+                    ])
+                    .run_capture_stderr()
+                    .map_err(|e| eyre!("Failed to extract {section} from UKI: {e}"))?;
+            }
+        }
+        crate::kernel::KernelKind::AndroidBoot => {
+            require_binary("unpack_bootimg")?;
+            let unpacked = "/run/qemu/aboot-unpacked";
+            fs::create_dir_all(unpacked)?;
+            Command::new("unpack_bootimg")
+                .args([
+                    "--boot_img",
+                    kernel_info.kernel_path.as_str(),
+                    "--out",
+                    unpacked,
+                ])
+                .stdout(Stdio::null())
+                .run_capture_stderr()
+                .map_err(|e| eyre!("Failed to unpack Android boot image: {e}"))?;
+            fs::rename(format!("{unpacked}/kernel"), kernel_mount)
+                .context("Getting kernel from Android boot image")?;
+            fs::rename(format!("{unpacked}/ramdisk"), initramfs_mount)
+                .context("Getting ramdisk from Android boot image")?;
+        }
+        crate::kernel::KernelKind::Traditional => {
+            let source_initramfs_path = kernel_info
+                .initramfs_path
+                .as_ref()
+                .ok_or_else(|| eyre!("Traditional kernel found but no initramfs path"))?;
 
-        // Extract .linux section (kernel) from UKI
-        Command::new("objcopy")
-            .args([
-                "--dump-section",
-                &format!(".linux={}", kernel_mount),
-                kernel_info.kernel_path.as_str(),
-            ])
-            .run()
-            .map_err(|e| eyre!("Failed to extract kernel from UKI: {e}"))?;
-        debug!("Extracted kernel from UKI to {}", kernel_mount);
-
-        // Extract .initrd section (initramfs) from UKI
-        Command::new("objcopy")
-            .args([
-                "--dump-section",
-                &format!(".initrd={}", initramfs_mount),
-                kernel_info.kernel_path.as_str(),
-            ])
-            .run()
-            .map_err(|e| eyre!("Failed to extract initramfs from UKI: {e}"))?;
-        debug!("Extracted initramfs from UKI to {}", initramfs_mount);
-    } else {
-        let source_initramfs_path = kernel_info
-            .initramfs_path
-            .as_ref()
-            .ok_or_else(|| eyre!("Traditional kernel found but no initramfs path"))?;
-
-        fs::File::create(kernel_mount)?;
-
-        // Bind mount kernel (read-only is fine)
-        Command::new("mount")
-            .args([
-                "--bind",
-                "-o",
-                "ro",
-                kernel_info.kernel_path.as_str(),
-                kernel_mount,
-            ])
-            .run()
-            .map_err(|e| eyre!("Failed to bind mount kernel: {e}"))?;
-
-        // Copy initramfs so we can append to it
-        fs::copy(source_initramfs_path, initramfs_mount)
-            .map_err(|e| eyre!("Failed to copy initramfs: {e}"))?;
+            // A bind mount can fail with EPERM on newer kernels due to
+            // locked-mount restrictions in user namespaces.
+            fs::copy(&kernel_info.kernel_path, kernel_mount)
+                .map_err(|e| eyre!("Failed to copy kernel: {e}"))?;
+            fs::copy(source_initramfs_path, initramfs_mount)
+                .map_err(|e| eyre!("Failed to copy initramfs: {e}"))?;
+        }
     }
+
+    // ARM64 kernels have no built-in decompressors, which means Qemu has to decompress
+    // the kernel itself. Qemu added zstd support in version 11.0, so if this ie not
+    // available, manually uncompress the kernel with the unzboot tool.
+    if std::env::consts::ARCH == "aarch64"
+        && is_zstd_efi_zboot(kernel_mount)?
+        && !qemu_supports_zstd_zboot()?
+    {
+        require_binary("unzboot")?;
+        let unwrapped = "/run/qemu/kernel-unwrapped";
+        Command::new("unzboot")
+            .args([kernel_mount, unwrapped])
+            .stdout(Stdio::null())
+            .run_capture_stderr()
+            .map_err(|e| eyre!("Unwrapping ARM64 zstd EFI zboot kernel: {e}"))?;
+        fs::rename(unwrapped, kernel_mount)?;
+    }
+    for path in [kernel_mount, initramfs_mount] {
+        if fs::metadata(path)?.len() == 0 {
+            return Err(eyre!("Extracted boot file is empty: {path}"));
+        }
+    }
+
+    remove_bootconfig(initramfs_mount)?;
 
     // Append bcvk units to initramfs
     // This includes:
@@ -1672,10 +1759,14 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     // Handle SSH key generation and credential injection
     if opts.common.ssh_keygen {
         let key_pair = crate::ssh::generate_default_keypair()?;
-        // Create credential and add to kernel args
         let pubkey = std::fs::read_to_string(key_pair.public_key_path.as_path())?;
-        let credential = crate::credentials::smbios_cred_for_root_ssh(&pubkey)?;
-        qemu_config.add_smbios_credential(credential);
+        let credential_path = Utf8Path::new(SSH_CREDENTIAL_PATH);
+        fs::write(
+            credential_path,
+            crate::credentials::key_to_root_tmpfiles_d(&pubkey),
+        )
+        .context("Writing SSH credential for QEMU fw_cfg")?;
+        qemu_config.add_systemd_credential_file("tmpfiles.extra", credential_path.to_owned());
     }
 
     // Build kernel command line for direct boot.
@@ -1690,7 +1781,14 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     let mut kernel_cmdline = [
         // This avoids having journald interact with the rootfs
         // at all, which lessens the I/O traffic for virtiofs
-        "systemd.journald.storage=volatile",
+        "systemd.mask=systemd-journal-flush.service",
+        // bootupd's automatic bootloader update needs a block device
+        // backing /boot or /sysroot, but here the root is virtiofs, so the
+        // unit fails and the system boots "degraded". Updating the
+        // bootloader makes no sense in an ephemeral VM anyway, and images
+        // will ship a bootupd without https://github.com/coreos/bootupd/pull/1072
+        // (which skips this case) for a long time.
+        "systemd.mask=bootloader-update.service",
         // See https://github.com/bootc-dev/bcvk/issues/22
         "selinux=0",
     ]
@@ -1702,10 +1800,16 @@ StandardOutput=file:/dev/virtio-ports/executestatus
         kernel_cmdline.push("console=hvc0".to_string());
     }
     if cloudinit {
-        // We don't provide any cloud-init datasource right now,
-        // though in the future it would make sense to do so,
-        // and switch over our SSH key injection.
-        kernel_cmdline.push("ds=iid-datasource-none".to_string());
+        // Fully disable cloud-init in ephemeral VMs. We don't provide any
+        // cloud-init datasource, and using `ds=None` (which tells cloud-init
+        // to use DataSourceNone) causes problems: the cloud-init generator
+        // still creates its activation symlink, which triggers a systemd
+        // drop-in condition (disable-sshd-keygen-if-cloud-init-active.conf)
+        // that prevents sshd-keygen from generating host keys. Since
+        // cloud-init itself never runs in the ephemeral VM (the boot target
+        // doesn't pull in multi-user.target), sshd ends up with no host
+        // keys and fails to start.
+        kernel_cmdline.push("cloud-init=disabled".to_string());
     }
 
     // Add Ignition platform kernel argument if Ignition config is specified
@@ -1769,8 +1873,9 @@ StandardOutput=file:/dev/virtio-ports/executestatus
         let path: &Utf8Path = tmpf.path().try_into().unwrap();
 
         Command::new("mkswap")
-            .args(["-q", path.as_str()])
-            .run()
+            .arg(path.as_str())
+            .stdout(Stdio::null()) // -q is available in util-linux >= 2.38, EL9 has 2.37
+            .run_capture_stderr()
             .map_err(|e| eyre!("{e}"))?;
 
         qemu_config.add_virtio_blk_device_with_format(
@@ -1798,7 +1903,7 @@ Options=
         let swap_dropin = format!("[Unit]\nWants={service_name}\n");
         let encoded_dropin = data_encoding::BASE64.encode(swap_dropin.as_bytes());
         let dropin_cred = format!(
-            "io.systemd.credential.binary:systemd.unit-dropin.default.target~bcvk-swap={encoded_dropin}"
+            "io.systemd.credential.binary:systemd.unit-dropin.basic.target~bcvk-swap={encoded_dropin}"
         );
         mount_unit_smbios_creds.push(dropin_cred);
         debug!("Generated SMBIOS credential for swap unit");
@@ -1842,7 +1947,7 @@ Options=
                 // Check if disk file exists and is accessible
                 if !Utf8Path::new(&disk_file).exists() {
                     return Err(eyre!(
-                        "Disk file does not exist in bwrap namespace: {} (serial: {})",
+                        "Disk file does not exist in the hybrid root: {} (serial: {})",
                         disk_file,
                         serial
                     ));
@@ -2009,10 +2114,6 @@ Options=
     if opts.common.ssh_keygen {
         qemu_config.enable_ssh_access(None); // Use default port 2222
         debug!("Enabled SSH port forwarding: host port 2222 -> guest port 22");
-
-        // We need to extract the public key from the SSH credential to inject it via SMBIOS
-        // For now, the credential is already being passed via kernel cmdline
-        // TODO: Add proper SMBIOS credential injection if needed
     }
 
     // Set main virtiofs configuration for root filesystem (will be spawned by QEMU)
@@ -2146,6 +2247,71 @@ Options=
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_zstd_efi_zboot() -> Result<()> {
+        use std::io::Write;
+
+        let mut header = [0u8; 60];
+        header[0..2].copy_from_slice(b"MZ");
+        header[4..8].copy_from_slice(b"zimg");
+        header[24..29].copy_from_slice(b"zstd\0");
+        header[56..60].copy_from_slice(&[0xcd, 0x23, 0x82, 0x81]);
+
+        for (contents, expected) in [
+            (header[..8].to_vec(), false),
+            (header.to_vec(), true),
+            (
+                {
+                    let mut data = header;
+                    data[4..8].copy_from_slice(b"nope");
+                    data.to_vec()
+                },
+                false,
+            ),
+            (
+                {
+                    let mut data = header;
+                    data[24..29].copy_from_slice(b"gzip\0");
+                    data.to_vec()
+                },
+                false,
+            ),
+            (
+                {
+                    let mut data = header;
+                    data[56..60].copy_from_slice(b"nope");
+                    data.to_vec()
+                },
+                false,
+            ),
+        ] {
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(&contents)?;
+            assert_eq!(is_zstd_efi_zboot(file.path().to_str().unwrap())?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_has_bootconfig_trailer() -> Result<()> {
+        use std::io::Write;
+
+        for (contents, expected) in [
+            (b"".as_slice(), false),
+            (b"short".as_slice(), false),
+            (b"initrd#BOOTCONFIG\n".as_slice(), true),
+            (b"initrd#BOOTCONFIG\ncpio".as_slice(), false),
+        ] {
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(contents)?;
+            assert_eq!(
+                has_bootconfig_trailer(file.path().to_str().unwrap())?,
+                expected
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_journal_json_to_text() {
