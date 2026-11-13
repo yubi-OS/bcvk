@@ -50,9 +50,9 @@ pub mod swu2f;
 mod virtiofsd;
 
 pub use credentials::{
-    generate_virtiofs_mount_unit, guest_path_to_unit_name, key_to_root_tmpfiles_d,
-    smbios_cred_for_root_ssh, smbios_cred_for_vsock_notify, smbios_creds_for_mount_unit,
-    smbios_creds_for_storage_opts, storage_opts_tmpfiles_d_lines,
+    generate_virtiofs_mount_unit, guest_path_to_unit_name, karg_for_root_ssh,
+    key_to_root_tmpfiles_d, smbios_cred_for_root_ssh, smbios_cred_for_vsock_notify,
+    smbios_creds_for_mount_unit, smbios_creds_for_storage_opts, storage_opts_tmpfiles_d_lines,
 };
 
 pub use qemu::{

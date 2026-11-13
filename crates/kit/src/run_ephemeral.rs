@@ -853,6 +853,10 @@ fn prepare_run_command_with_temp(
         .try_exists()?
         .then(|| format!("--device={}", qemu::VHOST_VSOCK));
 
+    cmd.arg("--privileged");
+    // Ubuntu rootful Podman needs the fully privileged profile for bcvk
+    // to bind-mount the extracted kernel inside its namespace.
+
     cmd.args([
         // Needed to create nested containers (mountns, etc). Note when running
         // with userns (podman unpriv default) this is totally safe. TODO:
@@ -1792,7 +1796,11 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     let vsock_force_disabled = std::env::var("BCVK_DEBUG").as_deref() == Ok("disable-vsock");
     let vsock_enabled = !vsock_force_disabled && qemu_config.enable_vsock().is_ok();
 
-    // Handle SSH key generation and credential injection
+    // Handle SSH key generation and credential injection. fw_cfg is the
+    // primary transport on every arch. On aarch64 DirectBoot there is no
+    // firmware, so also pass the public key through systemd's documented
+    // kernel-command-line credential fallback (same tmpfiles.extra payload).
+    let mut ssh_credential_karg = None;
     if opts.common.ssh_keygen {
         let key_pair = crate::ssh::generate_default_keypair()?;
         let pubkey = std::fs::read_to_string(key_pair.public_key_path.as_path())?;
@@ -1803,6 +1811,9 @@ StandardOutput=file:/dev/virtio-ports/executestatus
         )
         .context("Writing SSH credential for QEMU fw_cfg")?;
         qemu_config.add_systemd_credential_file("tmpfiles.extra", credential_path.to_owned());
+        if cfg!(target_arch = "aarch64") {
+            ssh_credential_karg = Some(crate::credentials::karg_for_root_ssh(&pubkey)?);
+        }
     }
 
     // YubiKey USB passthrough
@@ -1861,6 +1872,10 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     // This tells Ignition which platform it's running on and where to find the config
     if opts.ignition_config.is_some() {
         kernel_cmdline.push("ignition.platform.id=qemu".to_string());
+    }
+
+    if let Some(credential) = ssh_credential_karg {
+        kernel_cmdline.push(credential);
     }
 
     kernel_cmdline.extend(opts.kernel_args.clone());
