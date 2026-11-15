@@ -186,15 +186,6 @@ pub enum BootMode {
     },
 }
 
-/// A TPM 2.0 emulated by swtpm.
-#[derive(Debug, Clone)]
-pub struct TpmConfig {
-    /// Directory holding the TPM's persistent state.
-    pub state_dir: Utf8PathBuf,
-    /// Socket QEMU connects to.
-    pub socket_path: Utf8PathBuf,
-}
-
 /// Complete QEMU VM configuration with builder pattern.
 #[derive(Default, Debug)]
 pub struct QemuConfig {
@@ -240,9 +231,19 @@ pub struct QemuConfig {
 
     /// fw_cfg entries for passing config files to the guest
     fw_cfg_entries: Vec<(String, Utf8PathBuf)>,
+    /// USB host devices to pass through into the VM (e.g. YubiKey).
+    ///
+    /// Each device is forwarded via QEMU `-device usb-host`. A single USB 2.0
+    /// EHCI controller is inserted automatically when this list is non-empty.
+    pub usb_host_devices: Vec<crate::usb_passthrough::UsbHostDevice>,
 
-    /// TPM 2.0 to attach.
-    tpm: Option<TpmConfig>,
+    /// Raw QEMU arguments appended verbatim to the emulator command line.
+    /// CI-only escape hatch (ci_test-vgpu-vm.yml attaches a virtio-gpu device).
+    pub extra_qemu_args: Vec<String>,
+
+    /// Optional software TPM (swtpm) backing the QEMU emulator TPM device.
+    /// Test-only vTPM so `/dev/tpm0` is present in CI VMs without hardware.
+    pub swtpm: Option<crate::swtpm::SwtpmConfig>,
 }
 
 impl QemuConfig {
@@ -305,6 +306,15 @@ impl QemuConfig {
         self
     }
 
+    /// Enable a software TPM (swtpm) backed emulator TPM device.
+    ///
+    /// `socket_path` is the swtpm control socket QEMU connects to; `state_dir`
+    /// holds the (ephemeral) TPM NVRAM. Test-only; see yubi-OS/bcvk#3.
+    pub fn enable_swtpm(&mut self, socket_path: String, state_dir: String) -> &mut Self {
+        self.swtpm = Some(crate::swtpm::SwtpmConfig { socket_path, state_dir });
+        self
+    }
+
     /// Validate configuration before VM creation.
     pub fn validate(&self) -> Result<()> {
         // Memory validation
@@ -316,10 +326,6 @@ impl QemuConfig {
         }
         if self.memory_mb > 1024 * 1024 {
             return Err(eyre!("Memory too high: {}MB (maximum 1TB)", self.memory_mb));
-        }
-
-        if self.tpm.is_some() {
-            tpm_device()?;
         }
 
         // CPU validation
@@ -409,12 +415,6 @@ impl QemuConfig {
         self
     }
 
-    /// Attach a TPM 2.0 emulated by swtpm.
-    pub fn set_tpm(&mut self, tpm: TpmConfig) -> &mut Self {
-        self.tpm = Some(tpm);
-        self
-    }
-
     /// Set the main virtiofs configuration for the root filesystem.
     pub fn set_main_virtiofs(&mut self, config: VirtiofsConfig) -> &mut Self {
         self.main_virtiofs_config = Some(config);
@@ -486,6 +486,15 @@ impl QemuConfig {
     /// The file will be accessible in the guest via the fw_cfg interface.
     pub fn add_fw_cfg(&mut self, name: String, file_path: Utf8PathBuf) -> &mut Self {
         self.fw_cfg_entries.push((name, file_path));
+        self
+    }
+
+    /// Add a USB host device to pass through into the VM.
+    ///
+    /// A single QEMU USB 2.0 EHCI controller is inserted automatically
+    /// the first time this list becomes non-empty.
+    pub fn add_usb_host_device(&mut self, dev: crate::usb_passthrough::UsbHostDevice) -> &mut Self {
+        self.usb_host_devices.push(dev);
         self
     }
 
@@ -728,6 +737,14 @@ fn spawn(
         ]);
     }
 
+    // Software TPM (swtpm) emulator backend: chardev -> tpmdev -> tpm device.
+    // The guest kernel tpm_tis/tpm_crb driver creates /dev/tpm0 from this device.
+    if let Some(swtpm) = config.swtpm.as_ref() {
+        for arg in crate::swtpm::qemu_tpm_args(&swtpm.socket_path, std::env::consts::ARCH) {
+            cmd.arg(arg);
+        }
+    }
+
     // Add virtio-serial controller - always needed for console
     cmd.args(["-device", "virtio-serial"]);
 
@@ -837,15 +854,16 @@ fn spawn(
         cmd.args(["-fw_cfg", &format!("name={},file={}", name, file_path)]);
     }
 
-    if let Some(tpm) = &config.tpm {
-        cmd.args([
-            "-chardev",
-            &format!("socket,id=chrtpm,path={}", tpm.socket_path),
-            "-tpmdev",
-            "emulator,id=tpm0,chardev=chrtpm",
-            "-device",
-            &format!("{},tpmdev=tpm0", tpm_device()?),
-        ]);
+    // USB host device passthrough (e.g. YubiKey)
+    if !config.usb_host_devices.is_empty() {
+        for arg in crate::usb_passthrough::qemu_usb_args(&config.usb_host_devices) {
+            cmd.arg(arg);
+        }
+    }
+
+    // Raw pass-through QEMU arguments (CI vGPU device attach).
+    for arg in &config.extra_qemu_args {
+        cmd.arg(arg);
     }
 
     // Configure stdio based on display mode
@@ -870,77 +888,47 @@ fn spawn(
     cmd.spawn().context("Failed to spawn QEMU")
 }
 
-/// Wait until the process `name` creates `socket_path`. Fails if
-/// `process` exits first or `timeout` passes.
-async fn wait_for_socket(
-    name: &str,
-    socket_path: &Utf8Path,
-    process: &mut Pin<Box<dyn Future<Output = std::io::Result<Output>>>>,
-    timeout: Duration,
-) -> Result<()> {
-    let query_exists = async {
-        while !socket_path.exists() {
+/// Spawn a `swtpm socket` process providing a software TPM 2.0 over a UNIX
+/// control socket, then wait for the socket to appear so QEMU can connect.
+async fn spawn_swtpm(config: &crate::swtpm::SwtpmConfig) -> Result<Child> {
+    std::fs::create_dir_all(&config.state_dir)
+        .with_context(|| format!("creating swtpm state dir {}", config.state_dir))?;
+
+    let (program, args) = crate::swtpm::swtpm_socket_command(config);
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    // SAFETY: This API is safe to call in a forked child. Ties swtpm lifetime to ours.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))
+                .map_err(Into::into)
+        });
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
+    tracing::debug!("Spawning swtpm: {program} {args:?}");
+    let child = cmd.spawn().context("Failed to spawn swtpm")?;
+
+    let socket_path = Utf8Path::new(&config.socket_path).to_owned();
+    let wait = async {
+        loop {
+            if socket_path.exists() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     };
-    debug!("Waiting for socket at {socket_path}");
+    tokio::pin!(wait);
+    let timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(timeout);
     tokio::select! {
-        output = process => {
-            tracing::trace!("{name} exited");
-            let output = output?;
-            let status = output.status;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(eyre!(
-                "{name} failed to start for socket {socket_path}\nExit status: {status:?}\nOutput: {stderr}"
-            ))
-        }
-        _ = tokio::time::sleep(timeout) => {
-            Err(eyre!("timed out waiting for {name} socket {socket_path} to be created (waited {timeout:?})"))
-        }
-        _ = query_exists => {
-            debug!("{name} socket created: {socket_path}");
-            Ok(())
+        _ = &mut wait => {}
+        _ = &mut timeout => {
+            return Err(eyre!("timed out waiting for swtpm socket {}", config.socket_path));
         }
     }
-}
-
-/// The QEMU TPM device model for the host architecture.
-fn tpm_device() -> Result<&'static str> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok("tpm-tis"),
-        "aarch64" => Ok("tpm-tis-device"),
-        arch => Err(eyre!("TPM emulation is not supported on {arch}")),
-    }
-}
-
-/// Start swtpm for `tpm` and wait until it listens on its socket.
-async fn spawn_swtpm(
-    tpm: &TpmConfig,
-) -> Result<Pin<Box<dyn Future<Output = std::io::Result<Output>>>>> {
-    std::fs::create_dir_all(&tpm.state_dir)
-        .with_context(|| format!("Creating TPM state directory {}", tpm.state_dir))?;
-    let mut cmd = Command::new("swtpm");
-    cmd.args(["socket", "--tpm2", "--tpmstate"])
-        .arg(format!("dir={}", tpm.state_dir))
-        .arg("--ctrl")
-        .arg(format!("type=unixio,path={}", tpm.socket_path))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .lifecycle_bind_to_parent_thread();
-    let mut cmd = tokio::process::Command::from(cmd);
-    cmd.kill_on_drop(true);
-    debug!("{cmd:?}");
-    let child = cmd.spawn().context("Failed to spawn swtpm")?;
-    let mut process: Pin<Box<dyn Future<Output = std::io::Result<Output>>>> =
-        Box::pin(child.wait_with_output());
-    wait_for_socket(
-        "swtpm",
-        &tpm.socket_path,
-        &mut process,
-        Duration::from_secs(10),
-    )
-    .await?;
-    Ok(process)
+    tracing::debug!("swtpm socket ready: {}", config.socket_path);
+    Ok(child)
 }
 
 struct VsockCopier {
@@ -966,9 +954,9 @@ pub struct RunningQemu {
     pub virtiofsd_processes: Vec<Pin<Box<dyn Future<Output = std::io::Result<Output>>>>>,
     #[allow(dead_code)]
     sd_notification: Option<VsockCopier>,
-    /// The swtpm process backing the VM's TPM.
+    /// Host swtpm process backing the emulator TPM, kept alive for the VM lifetime.
     #[allow(dead_code)]
-    swtpm_process: Option<Pin<Box<dyn Future<Output = std::io::Result<Output>>>>>,
+    swtpm_process: Option<Child>,
 }
 
 impl std::fmt::Debug for RunningQemu {
@@ -986,12 +974,6 @@ impl std::fmt::Debug for RunningQemu {
 impl RunningQemu {
     /// Spawn QEMU with the given configuration.
     pub async fn spawn(mut config: QemuConfig) -> Result<Self> {
-        config.validate()?;
-        let swtpm_process = match &config.tpm {
-            Some(tpm) => Some(spawn_swtpm(tpm).await?),
-            None => None,
-        };
-
         // Spawn all virtiofsd processes first
         let mut awaiting_virtiofsd = Vec::new();
         let virtiofsd_configs = config
@@ -1006,16 +988,43 @@ impl RunningQemu {
         // Wait for all virtiofsd to be ready
         let mut virtiofsd_processes = Vec::new();
         while let Some((proc, socket_path)) = awaiting_virtiofsd.pop() {
+            let socket_path = &socket_path;
+            let query_exists = async move {
+                loop {
+                    if socket_path.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            tokio::pin!(query_exists);
+            let timeout_val = Duration::from_secs(60);
+            let timeout = tokio::time::sleep(timeout_val);
+            tokio::pin!(timeout);
+            debug!("Waiting for socket at {socket_path}");
             let mut output: Pin<Box<dyn Future<Output = std::io::Result<Output>>>> =
                 Box::pin(proc.wait_with_output());
-            wait_for_socket(
-                "virtiofsd",
-                &socket_path,
-                &mut output,
-                Duration::from_secs(60),
-            )
-            .await?;
+            tokio::select! {
+                output = &mut output => {
+                    tracing::trace!("virtiofsd exited");
+                    let output = output?;
+                    let status = output.status;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let log_path = format!("{socket_path}.log");
+                    let log_tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    return Err(eyre!(
+                        "virtiofsd failed to start for socket {socket_path}\nExit status: {status:?}\nStdout: {stdout}\nStderr: {stderr}\nLog file ({log_path}):\n{log_tail}"
+                    ));
+                }
+                _ = timeout => {
+                    return Err(eyre!("timed out waiting for virtiofsd socket {} to be created (waited {timeout_val:?})", socket_path));
+                }
+                _ = query_exists => {
+                }
+            }
             virtiofsd_processes.push(output);
+            tracing::debug!("virtiofsd socket created: {socket_path}");
         }
 
         let vsockdata = if let Some(vhost_fd) = config.vhost_fd.take() {
@@ -1117,6 +1126,13 @@ impl RunningQemu {
                 vec![cred]
             })
             .unwrap_or_default();
+
+        // Start the swtpm socket process (if configured) before QEMU connects.
+        let swtpm_process = if let Some(swtpm) = config.swtpm.clone() {
+            Some(spawn_swtpm(&swtpm).await?)
+        } else {
+            None
+        };
 
         // Spawn QEMU process with additional VSOCK credential if needed
         let qemu_process = spawn(&config, &creds, vsockdata)?;
@@ -1223,3 +1239,4 @@ mod tests {
         assert_eq!(config.fw_cfg_entries[1].1.as_str(), "/test/ssh-credential");
     }
 }
+
