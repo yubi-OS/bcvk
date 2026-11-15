@@ -44,18 +44,28 @@
 
 mod credentials;
 mod qemu;
+pub mod usb_passthrough;
+pub mod swtpm;
+pub mod swu2f;
 mod virtiofsd;
 
 pub use credentials::{
-    generate_virtiofs_mount_unit, guest_path_to_unit_name, key_to_root_tmpfiles_d,
-    smbios_cred_for_root_ssh, smbios_cred_for_vsock_notify, smbios_creds_for_mount_unit,
-    smbios_creds_for_storage_opts, storage_opts_tmpfiles_d_lines,
+    generate_virtiofs_mount_unit, guest_path_to_unit_name, karg_for_root_ssh,
+    key_to_root_tmpfiles_d, smbios_cred_for_root_ssh, smbios_cred_for_vsock_notify,
+    smbios_creds_for_mount_unit, smbios_creds_for_storage_opts, storage_opts_tmpfiles_d_lines,
 };
 
 pub use qemu::{
     qemu_version, BootMode, DiskFormat, DisplayMode, MachineType, NetworkMode, QemuConfig,
-    ResourceLimits, RunningQemu, TpmConfig, VirtioBlkDevice, VirtioSerialOut, VirtiofsMount,
-    VHOST_VSOCK,
+    ResourceLimits, RunningQemu, VirtioBlkDevice, VirtioSerialOut, VirtiofsMount, VHOST_VSOCK,
 };
 
+pub use usb_passthrough::{
+    detect_yubikeys, qemu_usb_args, require_yubikeys, UsbHostDevice, YUBICO_VENDOR_ID,
+};
+pub use swtpm::SwtpmConfig;
+
+pub use swu2f::Swu2fConfig;
+
 pub use virtiofsd::{spawn_virtiofsd_async, validate_virtiofsd_config, VirtiofsConfig};
+
