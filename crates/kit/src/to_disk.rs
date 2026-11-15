@@ -550,6 +550,7 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
     // - Attach target disk via virtio-blk
     // - Boot to bcvk-to-disk.target instead of default.target
     let ephemeral_opts = RunEphemeralOpts {
+        extra_qemu_args: Vec::new(),
         host_dns_servers: None,
         image: opts.get_installer_image().to_string(),
         common: common_opts,
@@ -573,7 +574,6 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
             opts.target_disk,
             opts.additional.format.as_str()
         )], // Attach target disk
-        tpm: false,
         kernel_args: vec!["systemd.unit=bcvk-to-disk.target".to_string()],
         ignition_config: None,
         debug_entrypoint: None,

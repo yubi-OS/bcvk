@@ -183,6 +183,21 @@ pub fn smbios_cred_for_root_ssh(pubkey: &str) -> Result<String> {
     Ok(r)
 }
 
+/// Generate kernel command-line argument for root SSH access.
+///
+/// Delivers the same `tmpfiles.extra` payload as the fw_cfg and SMBIOS paths
+/// through systemd's documented `systemd.set_credential_binary=` kernel
+/// command-line credential transport. The value is a public key, so its
+/// visibility in /proc/cmdline is acceptable. yubiOS uses this on aarch64
+/// DirectBoot as a second transport next to fw_cfg, so SSH access does not
+/// depend on the guest kernel exposing qemu_fw_cfg in sysfs.
+pub fn karg_for_root_ssh(pubkey: &str) -> Result<String> {
+    let k = key_to_root_tmpfiles_d(pubkey);
+    let encoded = data_encoding::BASE64.encode(k.as_bytes());
+    let r = format!("systemd.set_credential_binary=tmpfiles.extra:{encoded}");
+    Ok(r)
+}
+
 /// Convert SSH public key to systemd tmpfiles.d configuration.
 ///
 /// Generates configuration to create `/root/.ssh` directory (0750) and
@@ -207,6 +222,13 @@ mod tests {
     fn test_key_to_root_tmpfiles_d() {
         let expected = "d /root/.ssh 0750 - - -\nf+~ /root/.ssh/authorized_keys 700 - - - c3NoLXJzYSBBQUFBQjNOemFDMXljMkVBQUFBREFRQUJBQUFCQVFDLi4u\n";
         assert_eq!(key_to_root_tmpfiles_d(STUBKEY), expected);
+    }
+
+    #[test]
+    fn test_karg_for_root_ssh() {
+        let b64_tmpfiles = BASE64.encode(key_to_root_tmpfiles_d(STUBKEY).as_bytes());
+        let expected = format!("systemd.set_credential_binary=tmpfiles.extra:{b64_tmpfiles}");
+        assert_eq!(karg_for_root_ssh(STUBKEY).unwrap(), expected);
     }
 
     /// Test SMBIOS credential generation and format validation

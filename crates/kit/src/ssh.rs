@@ -47,13 +47,11 @@ pub fn generate_ssh_keypair(output_dir: &Utf8Path, key_name: &str) -> Result<Ssh
 
     debug!("Generating SSH keypair at {:?}", private_key_path);
 
-    // Generate RSA key with ssh-keygen
+    // Generate an ed25519 key with ssh-keygen (yubiOS guests reject RSA)
     let output = Command::new("ssh-keygen")
         .args([
             "-t",
-            "rsa",
-            "-b",
-            "4096", // Use 4096-bit RSA for security
+            "ed25519",
             "-f",
             private_key_path.as_str(),
             "-N",
