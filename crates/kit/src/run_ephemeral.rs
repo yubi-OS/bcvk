@@ -133,12 +133,6 @@ const IGNITION_SERIAL_NAME: &str = "ignition";
 /// Mount path for Ignition config inside the container
 const IGNITION_CONFIG_MOUNT_PATH: &str = "/run/ignition-config.json";
 
-/// The TPM state directory inside the container.
-const SWTPM_STATE_DIR: &str = "/run/swtpm";
-
-/// The swtpm control socket QEMU connects to.
-const SWTPM_SOCKET: &str = "/run/inner-shared/swtpm.sock";
-
 /// Kernel initramfs magic marker for bootconfig trailer.
 const BOOTCONFIG_MAGIC: &[u8; 12] = b"#BOOTCONFIG\n";
 
@@ -451,12 +445,36 @@ pub struct CommonVmOpts {
     )]
     pub ssh_keygen: bool,
 
+    /// Pass YubiKey(s) from the host into the VM via QEMU USB host passthrough.
+    ///
+    /// Detects all Yubico devices (vendor 0x1050) on the host via sysfs and
+    /// forwards them directly into the VM. Fails immediately if `--yubikey`
+    /// is set but no YubiKey is detected on the host.
+    #[clap(
+        long,
+        help = "Forward attached YubiKey(s) from host into the VM via USB passthrough"
+    )]
+    #[serde(default)]
+    pub yubikey: bool,
+
     #[clap(
         long = "virtiofsd",
         env = "VIRTIOFSD_BIN",
         help = "Path to virtiofsd binary (overrides auto-detection)"
     )]
     pub virtiofsd_binary: Option<String>,
+
+    #[clap(
+        long = "swtpm",
+        help = "Attach a software TPM 2.0 (swtpm) so /dev/tpm0 is present in the VM (test-only; CI without hardware)"
+    )]
+    pub swtpm: bool,
+
+    #[clap(
+        long = "swu2f",
+        help = "Load the uhid kernel module so an in-guest software FIDO2/U2F authenticator can expose /dev/uhid (test-only; CI without a physical YubiKey)"
+    )]
+    pub swu2f: bool,
 
     /// Select how VM output is presented.
     ///
@@ -552,14 +570,17 @@ pub struct RunEphemeralOpts {
     )]
     pub mount_disk_files: Vec<String>,
 
-    #[clap(
-        long = "tpm",
-        help = "Enable TPM 2.0 support using swtpm, with state discarded on exit"
-    )]
-    pub tpm: bool,
-
     #[clap(long = "karg", help = "Additional kernel command line arguments")]
     pub kernel_args: Vec<String>,
+
+    #[clap(
+        long = "extra-qemu-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        help = "Pass a raw argument straight through to QEMU (repeatable)"
+    )]
+    #[serde(default)]
+    pub extra_qemu_args: Vec<String>,
 
     #[clap(
         long = "ignition",
@@ -832,6 +853,10 @@ fn prepare_run_command_with_temp(
         .try_exists()?
         .then(|| format!("--device={}", qemu::VHOST_VSOCK));
 
+    cmd.arg("--privileged");
+    // Ubuntu rootful Podman needs the fully privileged profile for bcvk
+    // to bind-mount the extracted kernel inside its namespace.
+
     cmd.args([
         // Needed to create nested containers (mountns, etc). Note when running
         // with userns (podman unpriv default) this is totally safe. TODO:
@@ -846,6 +871,12 @@ fn prepare_run_command_with_temp(
         // Devices like /dev/kvm with group access need those groups propagated to the
         // container so commands in the container can use them
         "--group-add=keep-groups",
+        // Ubuntu/AppArmor hosts (unlike Fedora/SELinux) still confine privileged
+        // containers via a default AppArmor profile even with --cap-add=all; that
+        // profile denies the mount-propagation syscalls bwrap needs when it builds
+        // its isolated mount namespace ("bwrap: Failed to make / slave: Permission
+        // denied"). Disable AppArmor confinement the same way SELinux is disabled above.
+        "--security-opt=apparmor=unconfined",
         // This is a general hardening thing to do when running privileged
         "-v",
         "/sys:/sys:ro",
@@ -1765,7 +1796,11 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     let vsock_force_disabled = std::env::var("BCVK_DEBUG").as_deref() == Ok("disable-vsock");
     let vsock_enabled = !vsock_force_disabled && qemu_config.enable_vsock().is_ok();
 
-    // Handle SSH key generation and credential injection
+    // Handle SSH key generation and credential injection. fw_cfg is the
+    // primary transport on every arch. On aarch64 DirectBoot there is no
+    // firmware, so also pass the public key through systemd's documented
+    // kernel-command-line credential fallback (same tmpfiles.extra payload).
+    let mut ssh_credential_karg = None;
     if opts.common.ssh_keygen {
         let key_pair = crate::ssh::generate_default_keypair()?;
         let pubkey = std::fs::read_to_string(key_pair.public_key_path.as_path())?;
@@ -1776,6 +1811,18 @@ StandardOutput=file:/dev/virtio-ports/executestatus
         )
         .context("Writing SSH credential for QEMU fw_cfg")?;
         qemu_config.add_systemd_credential_file("tmpfiles.extra", credential_path.to_owned());
+        if cfg!(target_arch = "aarch64") {
+            ssh_credential_karg = Some(crate::credentials::karg_for_root_ssh(&pubkey)?);
+        }
+    }
+
+    // YubiKey USB passthrough
+    #[cfg(target_os = "linux")]
+    if opts.common.yubikey {
+        let keys = bcvk_qemu::usb_passthrough::require_yubikeys()?;
+        for key in keys {
+            qemu_config.add_usb_host_device(key);
+        }
     }
 
     // Build kernel command line for direct boot.
@@ -1827,8 +1874,28 @@ StandardOutput=file:/dev/virtio-ports/executestatus
         kernel_cmdline.push("ignition.platform.id=qemu".to_string());
     }
 
+    if let Some(credential) = ssh_credential_karg {
+        kernel_cmdline.push(credential);
+    }
+
     kernel_cmdline.extend(opts.kernel_args.clone());
+
+    // Software FIDO2/U2F (swu2f): QEMU cannot emulate a CTAP2 authenticator with the
+    // hmac-secret extension that systemd-cryptenroll requires, so the authenticator runs
+    // *inside* the guest over /dev/uhid. bcvk only ensures the uhid module is present.
+    if opts.common.swu2f {
+        bcvk_qemu::swu2f::push_uhid_kargs(&mut kernel_cmdline);
+    }
+
     qemu_config.set_kernel_cmdline(kernel_cmdline);
+
+    if opts.common.swtpm {
+        // swtpm control socket lives in the shared run dir; state in tmpfs.
+        qemu_config.enable_swtpm(
+            "/run/inner-shared/swtpm.sock".to_string(),
+            "/run/swtpm-state".to_string(),
+        );
+    }
 
     // Add Ignition config if specified
     // Different architectures require different methods (per FCOS docs):
@@ -1975,6 +2042,10 @@ Options=
                 });
             }
         }
+    }
+
+    for arg in &opts.extra_qemu_args {
+        qemu_config.extra_qemu_args.push(arg.clone());
     }
 
     qemu_config.set_console(opts.common.console);
@@ -2140,13 +2211,6 @@ Options=
     } else {
         None
     };
-
-    if opts.tpm {
-        qemu_config.set_tpm(qemu::TpmConfig {
-            state_dir: SWTPM_STATE_DIR.into(),
-            socket_path: SWTPM_SOCKET.into(),
-        });
-    }
 
     // Add virtio-blk devices
     for blk_device in virtio_blk_devices {
@@ -2406,3 +2470,4 @@ mod tests {
         }
     }
 }
+
